@@ -1,5 +1,6 @@
 # Build output
 build/
+build-output.txt
 out/
 target/
 

@@ -76,7 +76,15 @@ do_build() {
   log "compile src/test"
   compile src/test/java "${TEST_OUT}" "${MAIN_OUT}"
   log "test: ${MAIN_ENTRY}"
-  java -cp "${MAIN_OUT}:${TEST_OUT}" "${MAIN_ENTRY}"
+  # tee is safe here because this script runs with pipefail, so the test's exit code survives.
+  if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+    printf '### %s\n\n```\n' "$(git log -1 --pretty=%s 2>/dev/null || echo ledger-x)" \
+      >> "${GITHUB_STEP_SUMMARY}"
+  fi
+  java -cp "${MAIN_OUT}:${TEST_OUT}" "${MAIN_ENTRY}" | tee "${BUILD_DIR}/contract-test.log"
+  if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+    printf '```\n' >> "${GITHUB_STEP_SUMMARY}"
+  fi
 }
 
 case "${1:-all}" in
