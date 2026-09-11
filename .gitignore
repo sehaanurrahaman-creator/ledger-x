@@ -1,0 +1,16 @@
+# Build output
+build/
+out/
+target/
+
+# JVM
+*.class
+*.jar
+hs_err_pid*.log
+replay_pid*.log
+
+# Editors / OS
+.idea/
+*.iml
+.vscode/
+.DS_Store
