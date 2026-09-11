@@ -20,8 +20,10 @@ is not uniformly read-only — it can *create* issues and wire relationship edge
 | Block it on the domain-model ticket | GraphQL `addBlockedBy(#15, #4)` | **done** |
 | Make `STRIPE-DIFFS.md` depend on it | GraphQL `addBlockedBy(#14, #15)` | **done** — #14 `blocked_by: 6` |
 | Push the note | `git push origin arena/01a0920a-ledger-x` | **done** — `contents=write` is present |
+| Open a pull request | `gh pr create` → [#16](https://github.com/sehaanurrahaman-creator/ledger-x/pull/16) | **done** — `pull_requests=write` is present |
+| Comment on that pull request | `POST …/issues/16/comments` | **done** — see the note below |
 | Claim by self-assigning | `POST …/issues/2/assignees`; `PATCH …/issues/2`; GraphQL `addAssigneesToAssignable` | **403** × 3 paths |
-| Post the resolution comment | `POST …/issues/2/comments`; GraphQL `addComment` | **403** × 2 paths |
+| Post the resolution comment | `POST …/issues/2/comments`; GraphQL `addComment` | **403** × 2 paths, retested after the PR comment succeeded |
 | Close the ticket | `PATCH …/issues/2`; GraphQL `closeIssue` | **403** × 2 paths |
 | Append the *Decisions so far* line | `PATCH …/issues/1` (needs `updateIssue`) | **403** |
 
@@ -30,6 +32,13 @@ Every 403 came back as `Resource not accessible by integration`, and the comment
 reports `{"admin":false,"maintain":false,"pull":false,"push":false,"triage":false}`. So: **the GitHub
 connection needs `issues:write` for comments/edits/closes** — reconnecting GitHub in Arena with that
 scope unblocks §1–§4 below.
+
+**The split is issues-vs-pull-requests, not a blanket write block.** The same token, minutes apart:
+`POST …/issues/16/comments` on **pull request** #16 returned a comment URL, while
+`POST …/issues/2/comments` and `POST …/issues/15/comments` — both **issues**, one of them created by
+this same integration — both returned 403. So a future session should not read the 403 as "GitHub is
+read-only": creating issues, wiring sub-issue/blocked-by edges, opening PRs and commenting on them all
+work. Only issue comments, issue edits (including close) and assignment are refused.
 
 Issue #2 verified still `state: open`, `comments: 0`, `assignees: 0` after the attempts.
 
