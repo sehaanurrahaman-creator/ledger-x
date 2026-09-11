@@ -86,8 +86,13 @@ do_build() {
     printf '```\n' >> "${GITHUB_STEP_SUMMARY}"
   fi
   if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
-    # Surface the verdict as a run annotation: it is readable in the UI and from the API.
+    # Surface the verdict as run annotations: readable in the UI and from the API, unlike logs.
     echo "::notice::$(tail -n 1 "${BUILD_DIR}/contract-test.log")"
+    local detail
+    detail="$(grep -o 'platformThreads=[0-9]*' "${BUILD_DIR}/contract-test.log" | head -1 || true)"
+    if [ -n "${detail}" ]; then
+      echo "::notice::substrate contract measured ${detail} platform threads"
+    fi
   fi
 }
 
