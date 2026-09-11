@@ -225,5 +225,9 @@ somebody made rather than an accident of what was handy.
   RocksDB does expose `fdatasync` vs `fsync`; goroutines have no pinning trap; `PINNED` is still in the JDK on
   master.
 - Unchecked, and marked so: **Jaunt** — no public artifact by that name was found (see criterion 3).
-- The skeleton itself is verified by the run recorded in the ticket's resolution comment: `./build.sh` locally where
-  a JDK 21 is available, and GitHub Actions on the branch.
+- The skeleton is verified by GitHub Actions on branch `arena/01a09264-ledger-x`: eight runs, every one
+  `completed/success`, the head one publishing `notice: PASS 5/5 substrate checks` and
+  `notice: substrate contract measured platformThreads=10 platform threads` (run `34653473125`). The
+  virtual-thread claim in criterion 2 is therefore measured, not asserted: 10,000 concurrently-parked virtual
+  threads on 10 platform threads. Not verified locally — the sandbox this was written in has no JDK and no
+  reachable JDK download — so CI is the check of record for the compile and the test.
