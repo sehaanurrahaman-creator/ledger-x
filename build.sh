@@ -85,6 +85,10 @@ do_build() {
   if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
     printf '```\n' >> "${GITHUB_STEP_SUMMARY}"
   fi
+  if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
+    # Surface the verdict as a run annotation: it is readable in the UI and from the API.
+    echo "::notice::$(tail -n 1 "${BUILD_DIR}/contract-test.log")"
+  fi
 }
 
 case "${1:-all}" in
