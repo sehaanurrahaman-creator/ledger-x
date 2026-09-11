@@ -12,8 +12,8 @@ Probed 2026-09-11 from session `arena/01a09264-ledger-x` as `arena-ai-coding-age
 | Action | Call | Result |
 | --- | --- | --- |
 | Push the branch | `git push origin arena/01a09264-ledger-x` | **done** — 4 commits, `contents=write` present |
-| Run CI on it | GitHub Actions, `.github/workflows/ci.yml` | **done** — runs `34652362122`, `34652600248`, `34652731695`, `34652834123`, all `completed/success` |
-| Read the CI verdict | check-run annotations API | **done** — `notice: PASS 5/5 substrate checks` on check run `103438670842` |
+| Run CI on it | GitHub Actions, `.github/workflows/ci.yml` | **done** — 8 runs across the 6 commits, every one `completed/success` |
+| Read the CI verdict | check-run annotations API | **done** — `notice: PASS 5/5 substrate checks` and `notice: substrate contract measured platformThreads=10 platform threads` on check run `103440679530` |
 | Create the graduated fog tickets | `POST /repos/{owner}/{repo}/issues` | **done** → [#17](https://github.com/sehaanurrahaman-creator/ledger-x/issues/17), [#18](https://github.com/sehaanurrahaman-creator/ledger-x/issues/18) |
 | Attach them to the map | GraphQL `addSubIssue` × 2 | **done** — both appear under #1's sub-issues (17 children now) |
 | Wire the blocking edges | GraphQL `addBlockedBy` × 4 | **done** — `#17 blockedBy=[3] blocking=[13]`, `#18 blockedBy=[3] blocking=[11]` |
