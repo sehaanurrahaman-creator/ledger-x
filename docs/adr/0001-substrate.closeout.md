@@ -1,9 +1,10 @@
 # Closeout actions for *Substrate decision: Java + Loom or Go — and a hand-rolled log or RocksDB?*
 
-The decision is recorded as [`docs/adr/0001-substrate.md`](./0001-substrate.md), the CI skeleton on the chosen
-stack is green on branch `arena/01a09264-ledger-x`, and the fog it sharpened is graduated. The GitHub-side closeout
-is partly blocked by permissions; this file records exactly which parts, and holds the remaining payloads in final
-form so they can be posted verbatim by an identity that has the permission.
+The decision is recorded as [`docs/adr/0001-substrate.md`](./0001-substrate.md), merged into `main` as `eda1ea5`
+via [#19](https://github.com/sehaanurrahaman-creator/ledger-x/pull/19), the CI skeleton on the chosen stack is green
+there, and the fog it sharpened is graduated. The GitHub-side closeout is still partly blocked by permissions; this
+file records exactly which parts, holds the remaining payloads in final form so they can be posted verbatim by an
+identity that has the permission, and names a route that needs no issue permission at all (§0).
 
 ## What worked, what didn't
 
@@ -38,12 +39,42 @@ written:
   exactly one assignable user, `sehaanurrahaman-creator`, so the bot could not be self-assigned even with write
   access. A claim comment is the only claim record this integration can leave.
 
+## Re-probe, 2026-09-14 (session `arena/01a09fb3-ledger-x`)
+
+Nothing above has changed, and one thing is now more urgent.
+
+| Check | Result |
+| --- | --- |
+| `POST …/issues/3/comments` | **still 403** `Resource not accessible by integration` |
+| `GET /repos/{owner}/{repo}` | **still** `{"admin":false,"maintain":false,"pull":false,"push":false,"triage":false}` |
+| Issue #3 state | `open`, `comments=0`, `assignees=[]`, `sub_issues=0` — unchanged |
+| Blocking edges still wired | **yes** — `#17 blockedBy=[3]`, `#18 blockedBy=[3]` |
+| CI on `main` (`eda1ea5`, run `34838742618`) | **green**, annotations `PASS 5/5 substrate checks` and `platformThreads=10` — re-read from the API, so the ADR's verification section now cites this run rather than the branch run |
+| `./build.sh lint` on the merged tree | **passes** — 8 files clean; this is the one substrate check that needs no JDK, so it is the only locally verifiable step in this sandbox |
+
+**The observation that matters.** Issue #2 was closed by the maintainer with **zero comments**, and the map's
+`## Decisions so far` section is **still empty** — no line for #2, none for #3. So the convention of resolving by
+comment has not survived the permission gap, and the payloads below are the only copy of those two lines. Whoever
+posts them should post both, in order (§4).
+
+**And a route that needs no issue permission at all:** a pull request into `main` whose body contains `Closes #3`
+closes the ticket when the *maintainer* merges it — GitHub performs that close on merge, and the merge is the
+maintainer's write, not this integration's. That gets the ticket to `closed/completed` and leaves a linked PR as the
+record; it does not post the resolution comment, so §2 is still worth running if the comment is wanted on the
+ticket.
+
 ---
+
+## 0. Fastest route (no `issues:write` needed)
+
+1. Merge the follow-up PR from `arena/01a09fb3-ledger-x` — its body carries `Closes #3`, the resolution summary, and
+   both stale *Decisions so far* lines. Merging closes #3.
+2. Optionally run §2 and §4 for the full record (comment on the ticket, line on the map).
 
 ## 1. Claim (blocked)
 
 ```
-**Claimed.** Working this ticket in session `arena/01a09264-ledger-x`.
+**Claimed.** Worked in session `arena/01a09fb3-ledger-x` (first attempt `arena/01a09264-ledger-x`, 2026-09-11).
 
 Self-assignment is not available to this integration, on two independent counts: `GET /repos/{owner}/{repo}/assignees`
 returns exactly one assignable user — `sehaanurrahaman-creator` — so there is no login to assign; and every write path
@@ -54,7 +85,9 @@ treat the ticket as off the frontier.
 
 ## 2. Resolution comment (blocked)
 
-The body is in [`0001-substrate.resolution-comment.md`](./0001-substrate.resolution-comment.md), ready to post as-is:
+The body is in [`0001-substrate.resolution-comment.md`](./0001-substrate.resolution-comment.md) — post-ready as-is,
+written to be pasted straight onto the ticket (no bot-permission meta in it, every link pointing at `main`), and it
+ends by naming the map line it owes:
 
 ```
 gh api -X POST repos/{owner}/{repo}/issues/3/comments \
