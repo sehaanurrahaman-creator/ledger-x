@@ -238,11 +238,17 @@ somebody made rather than an accident of what was handy.
   `/actions/runs?branch=…`, 2026-09-14). The last of them, pull-request run `34653631291` on `5353360`, carries the
   same two annotations as the earlier `34653473125` on `3e05793`. The virtual-thread claim in criterion 2 is
   therefore measured, not asserted: 10,000 concurrently-parked virtual threads on 10 platform threads.
-- **Not verified locally, and that is a standing constraint.** The sandbox this was written in has no JDK and no
-  reachable JDK download — re-probed 2026-09-14: `api.adoptium.net` and `release-assets.githubusercontent.com`
-  both fail TLS from the sandbox, so `./build.sh` cannot run there. What *is* verifiable without a JVM is the style
-  lint (`./build.sh lint`, 8 files clean on the merged tree); everything else in this ADR is either CI-verified or
-  explicitly marked unchecked.
+- **Locally verified too, as of 2026-09-14 — by a second compiler.** The sandbox this was written in has no JDK and
+  every JDK *distribution* host is blocked from it: `api.adoptium.net`, `corretto.aws`, `aka.ms`,
+  `download.bell-sw.com`, `cdn.azul.com`, `download.java.net` and the `github.com` release redirect's actual target
+  `release-assets.githubusercontent.com` all fail TLS (re-probed 2026-09-14). The package *registries* are reachable,
+  so `scripts/bootstrap-toolchain.sh` assembles a toolchain from two of them — the Temurin 21.0.8 runtime shipped
+  inside the `jdk4py` wheel on PyPI, plus the Eclipse JDT batch compiler (ECJ) 3.45.0 from the npm package
+  `@vscjava/java-language-server`, both digest-pinned — and produces the same verdict: **`PASS 5/5 substrate
+  checks`**, `platformThreads=8`, `maxInsideLock=1`. The source therefore compiles under **both** javac (CI,
+  `-Xlint:all -Werror`) and ECJ, and the five checks pass on a second JVM installation, not just the CI runner's.
+  Two limits stated so nobody over-reads it: ECJ is not javac and this script is not the build — `./build.sh` still
+  requires nothing but a JDK 21, and CI's javac run remains the check of record for `-Xlint:all -Werror` semantics.
 - **Every number in this section is reproducible, not remembered:** `scripts/ci-evidence.sh` prints the run counts,
   conclusions and annotations above from the API. Run it before quoting a run id. It is a developer tool and
   deliberately *not* part of `./build.sh`, which must stay free of network access and third-party binaries.

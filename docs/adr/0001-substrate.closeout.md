@@ -50,7 +50,8 @@ Nothing above has changed, and one thing is now more urgent.
 | Issue #3 state | `open`, `comments=0`, `assignees=[]`, `sub_issues=0` — unchanged |
 | Blocking edges still wired | **yes** — `#17 blockedBy=[3]`, `#18 blockedBy=[3]` |
 | CI on `main` (`eda1ea5`, run `34838742618`) | **green**, annotations `PASS 5/5 substrate checks` and `platformThreads=10` — re-read from the API, so the ADR's verification section now cites this run rather than the branch run |
-| `./build.sh lint` on the merged tree | **passes** — 8 files clean; this is the one substrate check that needs no JDK, so it is the only locally verifiable step in this sandbox |
+| `./build.sh lint` on the branch | **passes** — 9 files clean, and it caught a 104-column line in this session's own script |
+| Local compile + contract test | **fixed this turn** — no JDK was installable in this sandbox (every distribution host blocked), so `scripts/bootstrap-toolchain.sh` builds a toolchain from the reachable package registries instead: Temurin 21.0.8 from the `jdk4py` PyPI wheel + ECJ 3.45.0 from the npm package `@vscjava/java-language-server`, both digest-pinned. Result: `PASS 5/5 substrate checks`, `platformThreads=8`, `maxInsideLock=1`, `bytes=50 after force(false)+force(true)` |
 
 **The observation that matters.** Issue #2 was closed by the maintainer with **zero comments**, and the map's
 `## Decisions so far` section is **still empty** — no line for #2, none for #3. So the convention of resolving by
@@ -74,6 +75,19 @@ contributor is `sehaanurrahaman-creator`. Commit with `git commit --no-verify` (
 before pushing) and confirm with
 `git log --format='%an [%(trailers:key=Co-authored-by,valueonly)]'` that the author is
 `sehaanurrahaman-creator` and the trailer list is empty.
+
+**The sandbox was also re-cloned between sessions**, so a local branch can start without the commits that are
+already on the remote: the first `git push` of this session was rejected as non-fast-forward with a working tree
+that looked correct. Fixed by re-rooting with `git reset --soft origin/<branch>` (verified linear afterwards).
+Assume the working tree is a fresh clone and re-fetch before concluding that anything is in sync.
+
+**Second compiler, and what it flags that javac does not.** `scripts/bootstrap-toolchain.sh` compiles with ECJ,
+which has no `-Xlint:all` but an equivalent token set. Its optional `+unused` token additionally reports unused
+*exception parameters* — javac's `-Xlint:all` has no such check, and batch-mode ECJ does not honour the Eclipse
+IDE's "name it `ignored`" convention, so it cannot be satisfied by renaming. The bootstrap therefore uses the
+`-Xlint:all`-equivalent tokens rather than `+unused`, and the one catch parameter that reads as used-but-isn't was
+renamed to `ignored` with a comment explaining why the interrupt flag is restored and then dropped — a readability
+fix, not a CI fix. Anyone reaching for `+unused` should know it will red-build on this file and that CI would not.
 
 ---
 

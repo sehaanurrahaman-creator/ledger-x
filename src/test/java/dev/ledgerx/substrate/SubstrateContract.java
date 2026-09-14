@@ -206,7 +206,9 @@ public final class SubstrateContract {
   private static void await(CountDownLatch latch) {
     try {
       latch.await();
-    } catch (InterruptedException interrupted) {
+    } catch (InterruptedException ignored) {
+      // A parked virtual thread that is interrupted still has to leave the latch wait, and the
+      // caller's own latch join() decides whether that mattered; restoring the flag is enough.
       Thread.currentThread().interrupt();
     }
   }
