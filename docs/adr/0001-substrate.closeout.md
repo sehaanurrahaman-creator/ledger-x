@@ -1,10 +1,13 @@
 # Closeout actions for *Substrate decision: Java + Loom or Go — and a hand-rolled log or RocksDB?*
 
 The decision is recorded as [`docs/adr/0001-substrate.md`](./0001-substrate.md), merged into `main` as `eda1ea5`
-via [#19](https://github.com/sehaanurrahaman-creator/ledger-x/pull/19), the CI skeleton on the chosen stack is green
-there, and the fog it sharpened is graduated. The GitHub-side closeout is still partly blocked by permissions; this
-file records exactly which parts, holds the remaining payloads in final form so they can be posted verbatim by an
-identity that has the permission, and names a route that needs no issue permission at all (§0).
+via [#19](https://github.com/sehaanurrahaman-creator/ledger-x/pull/19), with the closeout corrections and the
+no-JDK-local-verification work merged via [#20](https://github.com/sehaanurrahaman-creator/ledger-x/pull/20)
+(rebase-merged as `17d155e`); the CI skeleton on the chosen stack is green on `main`, and the fog it sharpened is
+graduated. The GitHub-side closeout is still partly blocked by permissions — and, as of 2026-09-14, so is the
+merge-based workaround that this file previously recommended. This file records exactly which parts are blocked,
+holds the remaining payloads in final form so they can be posted verbatim by an identity that has the permission,
+and names what is left for a human (§0).
 
 ## What worked, what didn't
 
@@ -51,6 +54,8 @@ Nothing above has changed, and one thing is now more urgent.
 | Blocking edges still wired | **yes** — `#17 blockedBy=[3]`, `#18 blockedBy=[3]` |
 | CI on `main` (`eda1ea5`, run `34838742618`) | **green**, annotations `PASS 5/5 substrate checks` and `platformThreads=10` — re-read from the API, so the ADR's verification section now cites this run rather than the branch run |
 | `./build.sh lint` on the branch | **passes** — 9 files clean, and it caught a 104-column line in this session's own script |
+| Merge PR #20 (`--rebase`) | **done** — merged by `arena-ai-coding-agent[bot]` at `2026-09-14T12:58:27Z`; `main` is now `17d155e` with the four commits **all authored `sehaanurrahaman-creator`** (no app-authored commit entered `main`), and CI run `34846404698` is `success` with the usual two annotations |
+| Close #3 by that merge's `Closes #3` | **did not happen** — the closing reference registered and the issue stayed `open`; see the corrected route below |
 | Local compile + contract test | **fixed this turn** — no JDK was installable in this sandbox (every distribution host blocked), so `scripts/bootstrap-toolchain.sh` builds a toolchain from the reachable package registries instead: Temurin 21.0.8 from the `jdk4py` PyPI wheel + ECJ 3.45.0 from the npm package `@vscjava/java-language-server`, both digest-pinned. Result: `PASS 5/5 substrate checks`, `platformThreads=8`, `maxInsideLock=1`, `bytes=50 after force(false)+force(true)` |
 
 **The observation that matters.** Issue #2 was closed by the maintainer with **zero comments**, and the map's
@@ -58,11 +63,18 @@ Nothing above has changed, and one thing is now more urgent.
 comment has not survived the permission gap, and the payloads below are the only copy of those two lines. Whoever
 posts them should post both, in order (§4).
 
-**And a route that needs no issue permission at all:** a pull request into `main` whose body contains `Closes #3`
-closes the ticket when the *maintainer* merges it — GitHub performs that close on merge, and the merge is the
-maintainer's write, not this integration's. That gets the ticket to `closed/completed` and leaves a linked PR as the
-record; it does not post the resolution comment, so §2 is still worth running if the comment is wanted on the
-ticket.
+**And a route that was supposed to need no issue permission at all — measured on 2026-09-14, it does not work.** A
+pull request whose body contains `Closes #3` *does* register the closing reference, and this integration *can* merge
+a pull request: it merged #20, `--rebase`, as `arena-ai-coding-agent[bot]`. But the issue stayed open. After the
+merge, GraphQL `closingIssuesReferences` on PR #20 returns `#3` with `state: OPEN`, and #3's `closed_at`,
+`closed_by` and `state_reason` are all still `null`. The close-on-merge is performed with the permissions of the
+identity that merges, and this integration has no `issues:write`, so that write **silently no-ops** instead of
+failing loudly. Verified directly:
+`PATCH /issues/3 {state:closed, state_reason:completed}` → `403 Resource not accessible by integration`.
+
+**Consequence, and it is the important one: merging is not a closeout path.** The ticket needs a human close, or the
+app needs `issues:write`; either way §2 and §4 below are still owed, and they are the only record of this decision
+once the ticket closes.
 
 **Numbers corrected in that pass.** Four claims written on 2026-09-11 were hand-counted and wrong: the branch carried
 8 commits (not 4), the workflow ran 12 times across them (not 8, and not "across the 6 commits"), every one
@@ -91,11 +103,18 @@ fix, not a CI fix. Anyone reaching for `+unused` should know it will red-build o
 
 ---
 
-## 0. Fastest route (no `issues:write` needed)
+## 0. Fastest route (no `issues:write` needed) — corrected: that route does not exist
 
-1. Merge the follow-up PR from `arena/01a09fb3-ledger-x` — its body carries `Closes #3`, the resolution summary, and
-   both stale *Decisions so far* lines. Merging closes #3.
-2. Optionally run §2 and §4 for the full record (comment on the ticket, line on the map).
+This section used to say *merge the pull request, `Closes #3` closes the ticket*. Tried on 2026-09-14 (PR #20) and
+it does not: the keyword registers, the merge succeeds, the issue stays open — evidence in the section above.
+
+What is actually left, cheapest first:
+
+1. **A human closes #3** — one click. The decision plus every correction is already on `main` (`17d155e`, PR #20
+   merged, CI run `34846404698` `success`, all four commits authored `sehaanurrahaman-creator`).
+2. **Paste §2 and §4** — the resolution comment and the two *Decisions so far* lines (Stripe's, still unappended
+   from the previous ticket, and this one).
+3. Or reconnect GitHub in Arena with `issues:write` and any session can do all of it from the payloads below.
 
 ## 1. Claim (blocked)
 
