@@ -2,19 +2,24 @@
 
 The decision is recorded as [`docs/adr/0002-domain-model.md`](./0002-domain-model.md), implemented in
 `src/main/java/dev/ledgerx/domain/`, proved by `src/test/java/dev/ledgerx/domain/` and demonstrated by `make demo`.
-Everything is committed on branch `arena/01a0a081-ledger-x` and verified locally end to end.
+It is committed on branch `arena/01a0a081-ledger-x`, **pushed**, and open as
+[pull request #22](https://github.com/sehaanurrahaman-creator/ledger-x/pull/22) with
+[CI green](https://github.com/sehaanurrahaman-creator/ledger-x/actions/runs/34890770933) — run `34890770933` on head
+`59947f5`, `success` in 37 s: `Build and test` 10 s, `Demo` 3 s, `Extended property campaign` 23 s.
 
-**Nothing GitHub-side could be done from this session.** Two separate blockages, in this order, and they are worth
-telling apart because they have different fixes:
+**What is still owed is every issue-side write**, because this integration has none: `POST …/issues/4/comments` is
+`403 Resource not accessible by integration`, and the repository permission level reads
+`{"admin":false,"maintain":false,"pull":false,"push":false,"triage":false}`. So #4 will not close itself when #22 is
+merged — ADR 0001's closeout measured exactly that, and a `Closes #4` in a PR body registers the reference and then
+silently no-ops when the merging identity has no `issues: write`. §1–§5 hold the payloads; §0 is the order to do them
+in.
 
-1. **Issue writes are refused for this app** — the same 403 ADR 0001's closeout records, re-probed here while the
-   credentials still worked (§ *What worked, what didn't*).
-2. **Then the credentials expired mid-session**, which also took away the push and the pull request. The token in the
-   environment is a 24-character `arena-…` placeholder rather than a GitHub token, `gh api user` answers
-   `401 Bad credentials`, and both push routes fail with `Invalid username or token`.
-
-So this branch is **local only** at the time of writing: no push, no PR, no CI run to cite, no comment, no close, no
-new ticket. §0 is the shortest route to finishing; §1–§5 hold every payload in final, paste-ready form.
+One thing worth recording about this session, because it shaped the file: **the GitHub credentials expired partway
+through and later recovered.** At 19:10 UTC `gh api user` answered `401 Bad credentials` and `GH_TOKEN` was a
+24-character `arena-…` placeholder, so the branch could not be pushed and an earlier version of this file was written
+as if nothing GitHub-side were possible at all. By the time the work was finished the token was valid again, and the
+push, the PR and two CI runs happened. The permission refusals did **not** recover — those are the app's install
+permissions, not a token lifetime — so the split is: contents work, issues do not.
 
 ## What worked, what didn't
 
@@ -22,28 +27,27 @@ Probed from session `arena/01a0a081-ledger-x` on 2026-09-14, as `arena-ai-coding
 
 | Action | Call | Result |
 | --- | --- | --- |
-| Read the map, this ticket and the closed ones | `gh issue view 1/4`, `gh pr view 19/20/21`, `gh issue list` | **done**, early in the session while the token worked |
+| Read the map, this ticket and the closed ones | `gh issue view 1/4`, `gh pr view 19/20/21`, `gh issue list` | **done** |
 | Repository permission level | `GET /repos/{owner}/{repo}` | `{"admin":false,"maintain":false,"pull":false,"push":false,"triage":false}` — unchanged from ADR 0001's closeout |
-| Claim by self-assigning | — | **not attempted**: `GET …/assignees` returns exactly one assignable user, `sehaanurrahaman-creator`, and ADR 0001's closeout already recorded that every write path is refused |
+| Claim by self-assigning | — | **not attempted**: `GET …/assignees` returns exactly one assignable user, `sehaanurrahaman-creator`, and every write path is refused anyway |
 | Post a comment on this ticket | `POST …/issues/4/comments` | **blocked** — `403 Resource not accessible by integration` |
-| Push the branch | `git push -u origin arena/01a0a081-ledger-x` | **blocked** — first `could not read Username for 'https://github.com'`, then after `gh auth setup-git` and again with an explicit `x-access-token:` URL, `Invalid username or token. Password authentication is not supported for Git operations.` |
-| Anything at all, later in the session | `gh api user`, `gh api rate_limit`, `git ls-remote origin` | **blocked** — `401 Bad credentials`; `GH_TOKEN` is an `arena-…` placeholder, 24 characters |
-| Build, test, demo, lint, campaign locally | `./build.sh`, `make demo`, `make campaign`, `scripts/bootstrap-toolchain.sh` | **done** — see §6; this is the part of the ticket that is finished |
-| Commit without the sandbox's trailer | `git commit --no-verify` × 5 | **done** — see § *Commit hygiene* |
-
-The credential expiry is the new fact here, and it is the reason this file exists in the shape it does: ADR 0001's
-closeout could at least push a branch and open a PR, so only the issue-side payloads were owed. This one owes
-everything GitHub-side.
+| Push the branch | `git push -u origin arena/01a0a081-ledger-x` | **done**, after the credentials recovered — first attempt failed `could not read Username`, then `Invalid username or token` while the token was a placeholder, then `* [new branch]` |
+| Open the pull request | `gh pr create` | **done** — [#22](https://github.com/sehaanurrahaman-creator/ledger-x/pull/22), body = the resolution comment plus a heads-up that merging will not close #4 |
+| CI | `./build.sh`, `make demo`, `make campaign` | **done and green**, after two red runs — see §6 for what they caught |
+| Read the runner log | `gh run view --log-failed`, `…/actions/jobs/{id}/logs` | **blocked** — the log zip is served from `results-receiver.actions.githubusercontent.com`, which is unreachable from this sandbox (`EOF` on the redirect). This is why a failing step now publishes its own diagnostics as check annotations |
+| Read CI evidence through the API | `scripts/ci-evidence.sh`, `…/check-runs/{id}/annotations` | **done** — the annotations are how the two failures were diagnosed without a log |
+| Build, test, demo, lint, campaign locally | `./build.sh`, `make demo`, `make campaign` | **done** — see §6 |
+| Commit without the sandbox's trailer | `git commit --no-verify`, every commit | **done** — see *Commit hygiene* |
 
 ## 0. Fastest route
 
-1. **Reconnect GitHub in Arena** (or hand this branch to an identity with `contents: write` and `issues: write`):
-   `git push -u origin arena/01a0a081-ledger-x`, then open the PR with the body in § *Pull request body*, then §1–§5.
-2. **A human closes #4** and pastes §2 and §4 — the decision, the code, the tests and the demo are all committed on
-   the branch and will be on `main` the moment it is pushed and merged.
-3. If only `contents: write` comes back, the push and PR unblock, and §1–§5 remain payloads for whoever has
-   `issues: write`. Merging is **not** a closeout path: ADR 0001's closeout measured that a `Closes #4` in a PR body
-   registers the reference and then silently no-ops when the merging identity has no `issues: write`.
+1. **Merge [#22](https://github.com/sehaanurrahaman-creator/ledger-x/pull/22).** CI is green; nothing in it needs a
+   second look except the two red runs it went through first, both recorded in §6.
+2. **A human then does four things this integration cannot**, all payloads below: paste §2 as a comment on #4, close
+   #4 (`state_reason=completed`), replace #1's *Decisions so far* section with §4 — which carries **three** lines,
+   because the two from earlier tickets are still unappended — and file §5's new ticket with its two edges.
+3. If only `contents: write` is ever granted and not `issues: write`, nothing changes: §1–§5 stay payloads for
+   whoever has it. Merging is not a closeout path.
 
 ## 1. Claim (blocked)
 
@@ -163,37 +167,49 @@ gh api graphql -f query='mutation($a:ID!,$b:ID!){addBlockedBy(input:{issueId:$a,
   -F a="$(…id of #7…)" -F b="$(…id of NEW…)"
 ```
 
-## 6. What was verified locally, and how
+## 6. What was verified, where, and what CI caught
 
-No JDK is installable in this sandbox, so `scripts/bootstrap-toolchain.sh` built one: Temurin 21.0.8 runtime from a
-digest-pinned PyPI wheel, Eclipse JDT batch compiler 3.45.0 from npm, and — new in this change — `java`/`javac` shims,
-so that **`./build.sh` itself** ran rather than a parallel script. `PATH="$PWD/build/toolchain/bin:$PATH" ./build.sh`:
+**CI — the check of record.** Run `34890770933` (`pull_request`, head `59947f5`, `ubuntu-latest`, Temurin 21):
+**success**, 37 s. Annotations read back through the API: `PASS 5/5 substrate checks` with
+`platformThreads=10`; `PASS 9/9 property checks — 127 random cases`; `PASS 9/9 property checks — 307 random cases,
+30344 accepted, 17946 rejected, 4153 refused at construction, 7557 accounts opened; widest 12 entries, largest amount
+9223372036854775807, negative balances 114146, same-account-twice 18421, self-cancelling 4187; reasons
+TOO_FEW_ENTRIES=2291 UNKNOWN_ACCOUNT=4082 OVERFLOWING_TOTALS=2133 UNBALANCED=5843 OVERFLOWING_BALANCE=3597`.
+Those campaign counters are **identical, digit for digit, to the local run** on a different machine, JVM build,
+compiler and `awk` — the determinism claim verified off-box rather than asserted.
+
+**Two runs before it failed, and both failures are kept.**
+
+| Run | Step | Cause |
+| --- | --- | --- |
+| `34887589236`, `34889657513` | `Build and test`, 11–12 s | `lint: selftest: the floating-point rule matched 0 of the 7 violations it must match`. POSIX escape-processes an `awk -v` value, so under **gawk** `\(` arrived as `(` and the rule's regexes stopped being the regexes that were written. **mawk** and **busybox awk** pass `-v` through untouched — every local run was green and only CI was red. Reproduced rather than guessed at: the pattern as gawk's `-v` delivers it does not compile at all (`Value(` loses its escape, the paren goes unbalanced), where through `ENVIRON` it matches 7 of 7. Fixed by passing patterns through the environment, plus a selftest tripwire written to discriminate — its fixture line has no parentheses, so an intact `\(double\)` matches nothing while a stripped `(double)` matches the bare word and names `-v` in the failure. |
+| — | — | Diagnosing the above needed a second change: the runner's log is served from a blob host unreachable from this sandbox, so a failing step now publishes its own first or last twelve lines as `::error` annotations. That is how the cause arrived — ten lines of JSON, no log download. |
+
+**Local, with the fallback toolchain.** No JDK is installable here, so `scripts/bootstrap-toolchain.sh` built one:
+Temurin 21.0.8 runtime from a digest-pinned PyPI wheel, Eclipse JDT batch compiler 3.45.0 from npm, and `java`/`javac`
+shims so that **`./build.sh` itself** ran rather than a parallel script.
 
 | Command | Result |
 | --- | --- |
-| `./build.sh lint` | `lint: 36 file(s) clean, rules 6 and 7 self-tested` (the count grows with each ADR: `docs/adr` is in scope) |
+| `./build.sh lint` | `lint: 36 file(s) clean, rules 6 and 7 self-tested` — under mawk, and again under busybox awk |
 | `./build.sh` | 13 main + 11 test sources compiled; `PASS 5/5 substrate checks` (`platformThreads=8`); `PASS 9/9 property checks — 127 random cases`, 12,000 campaign operations, 5,838 accepted / 3,706 rejected / 844 refused at construction, widest 12 entries, reasons `TOO_FEW_ENTRIES=492 UNKNOWN_ACCOUNT=785 OVERFLOWING_TOTALS=457 UNBALANCED=1137 OVERFLOWING_BALANCE=835` (~3 s) |
-| `make campaign` (150 × 400) | `PASS 9/9 property checks — 307 random cases`, 30,344 accepted / 17,946 rejected / 4,153 refused, reasons `2291 / 4082 / 2133 / 5843 / 3597` (~22 s) |
+| `make campaign` (150 × 400) | `PASS 9/9 property checks — 307 random cases`, 30,344 accepted / 17,946 rejected / 4,153 refused, reasons `2291 / 4082 / 2133 / 5843 / 3597` (~22 s) — the run CI reproduced exactly |
 | 400 × 600, by hand | `PASS 9/9`, 123,780 accepted / 69,886 rejected / 16,465 refused (~141 s) |
 | `make demo` | nine events, Σ balances `0.00`, escrow at `-26.55` flagged `UNNATURAL for ASSET`, two refusals proved to have changed nothing, `demo ok` |
-| lint rule 7, both directions | injecting `public double asDouble() { return (double) minorUnits / 100.0d; }` into `Money.java` → `lint: …/Money.java: floating point in the domain` naming lines 78 and 79, exit 1; removed → clean |
+| lint rule 7, both directions | appending `public double asDouble()` to `Money.java` → `floating point in the domain`, naming line 115, exit 1; removed → clean |
 
-**Not verified locally, stated plainly:** `-Xlint:all -Werror` under javac, because there is no javac here. CI's
-run is the check of record and there is no CI run yet, since the push is blocked. One compiler divergence was found
-and designed around rather than suppressed: ECJ ignores `@SuppressWarnings("unchecked")` once `-err:+unchecked`
-promotes the warning, so an unchecked cast compiles under javac and not locally. Nothing in `src/` depends on a
-suppression — the audit check's reflection goes through `Method.invoke` — and anyone adding one should know it will
-red-build locally and green-build in CI.
+**What CI settled that could not be settled locally:** javac's `-Xlint:all -Werror` accepted all 24 sources with no
+warnings. javac on JDK 21 checks things ECJ does not (`this-escape`, `serial`, `lossy-conversions`), so the
+ECJ-compiled tree could have been hiding a javac-only lint; it was not. The other divergence between the two compilers
+went the opposite way and is recorded in ADR 0002 §11: ECJ ignores `@SuppressWarnings("unchecked")` once
+`-err:+unchecked` promotes the warning, so an unchecked cast red-builds locally and green-builds in CI. Nothing in
+`src/` depends on a suppression — the audit check's reflection goes through `Method.invoke`.
 
-Once the branch is pushed, read the CI evidence rather than remembering it:
+Re-read any of it rather than trusting this file:
 
 ```
 scripts/ci-evidence.sh arena/01a0a081-ledger-x
 ```
-
-and put the run ids, conclusions and the two annotations the build publishes into ADR 0002's *Verification* section,
-replacing the local-only numbers above. ADR 0001's closeout records what happened last time those numbers were
-hand-counted instead.
 
 ## Commit hygiene
 
@@ -203,27 +219,28 @@ must not reach this repository — the only contributor is `sehaanurrahaman-crea
 with `git commit --no-verify`, and checked with:
 
 ```
-git log -5 --format='%h %an <%ae> | %cn | co-author:[%(trailers:key=Co-authored-by,valueonly)]'
+git log origin/main..HEAD --format='%h %an <%ae> | %cn | co-author:[%(trailers:key=Co-authored-by,valueonly)]'
 ```
 
-which reports all five commits authored *and* committed by
+which reports every commit on the branch authored *and* committed by
 `sehaanurrahaman-creator <326990662+sehaanurrahaman-creator@users.noreply.github.com>` with an empty trailer list.
 
-## Pull request body
+## Pull request
 
-`decide(domain): ADR 0002 — n-entry transactions, integer minor units, one event log, proved in memory`
+[#22](https://github.com/sehaanurrahaman-creator/ledger-x/pull/22) —
+`decide(domain): ADR 0002 — n-entry transactions, integer minor units, one event log, proved in memory`. Its body is
+the resolution comment (§2) verbatim, with a heads-up at the top that `Closes #4` will not close #4 and a pointer to
+§4 of this file for the map lines.
 
-The resolution comment (§2) is written to be posted on the ticket and reads correctly as a PR body too; the file list
-is:
+The change, by commit:
 
-- `docs/adr/0002-domain-model.md` — the decision, the losing alternatives, the bug the suite found, what the nine
-  checks assert, the three campaign sizes measured, the consequences accepted, and what changes for eleven other
-  tickets. Every quoted claim about the JDK, Modern Treasury and jqwik is linked to the source it was read from.
-- `src/main/java/dev/ledgerx/domain/` — 11 files: `Money`, `Side`, `Entry`, `AccountId`, `AccountKind`, `Account`,
-  `Transaction`, `JournalEvent`, `RejectionReason`, `RejectedTransactionException`, `InMemoryLedger`.
-- `src/main/java/dev/ledgerx/demo/TransferDemo.java` + `Makefile` — `make demo`.
-- `src/test/java/dev/ledgerx/testing/` — the harness: `RandomSource`, `Shrink`, `PropertyRunner`.
-- `src/test/java/dev/ledgerx/domain/` — `LedgerOp`, `OpEntry`, `OpGenerator`, `ModelLedger`, `OpApplier`,
-  `JournalDigest`, `DomainModelProperties`.
-- `build.sh`, `scripts/lint.sh`, `scripts/bootstrap-toolchain.sh`, `.github/workflows/ci.yml`, `README.md`.
-- `docs/adr/0002-domain-model.resolution-comment.md` + `.closeout.md` — the payloads this session could not post.
+| Commit | What it carries |
+| --- | --- |
+| `21a13e7` | `src/main/java/dev/ledgerx/domain/` — 11 files: `Money`, `Side`, `Entry`, `AccountId`, `AccountKind`, `Account`, `Transaction`, `JournalEvent`, `RejectionReason`, `RejectedTransactionException`, `InMemoryLedger` |
+| `8546e46` | the property suite: `src/test/java/dev/ledgerx/testing/` (harness) and `…/domain/` (generators, `BigInteger` oracle, applier, digest, nine checks) |
+| `64c90a0` | `src/main/java/dev/ledgerx/demo/TransferDemo.java` and the `Makefile` facade |
+| `813b01a` | build wiring: subcommands, annotations, campaign env vars, self-testing lint rules, toolchain shims, CI steps, README |
+| `6bb2aa8` | `docs/adr/0002-domain-model.md` + the resolution comment + this closeout |
+| `f1a862c` | a failing step publishes its own diagnostics as check annotations; ADR sections numbered so the twelve `§N` references in the sources resolve |
+| `59947f5` | the `awk -v` fix and its tripwire — the change that made CI green |
+| the commit carrying this file | ADR §10–§11 given CI's run numbers and both failures; this closeout rewritten against what actually happened rather than what looked possible at 19:10 UTC |

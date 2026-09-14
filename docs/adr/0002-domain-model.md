@@ -357,6 +357,13 @@ Measured on 2026-09-14 with the fallback toolchain (Temurin 21.0.8 runtime, ECJ-
 | `./build.sh` default — 60 cases × 200 operations | 12,000 | `PASS 9/9`, 5,838 accepted, 3,706 rejected, 844 refused at construction, widest transaction 12 entries; reasons `TOO_FEW_ENTRIES=492 UNKNOWN_ACCOUNT=785 OVERFLOWING_TOTALS=457 UNBALANCED=1137 OVERFLOWING_BALANCE=835` | ~3 s |
 | `make campaign` — 150 × 400 | 60,000 | `PASS 9/9`, 30,344 accepted, 17,946 rejected, 4,153 refused at construction; reasons `2291 / 4082 / 2133 / 5843 / 3597` | ~22 s |
 | 400 × 600, run by hand | 240,000 | `PASS 9/9`, 123,780 accepted, 69,886 rejected, 16,465 refused at construction; reasons `8707 / 16186 / 8297 / 23888 / 12808` | ~141 s |
+| CI, `ubuntu-latest`, run `34890770933` | 60,000 | `PASS 9/9`, 307 cases — **counters identical to the local `make campaign`**, digit for digit | 23 s |
+
+That last row is the determinism claim verified off-box rather than asserted: a different machine, a different JVM
+build, a different compiler and a different `awk`, and the campaign produced the same 307 cases, the same 30,344
+accepted, 17,946 rejected and 4,153 refused at construction, and the same five reason counts. That is what a
+hand-written SplitMix64 buys over `java.util.Random`, and it is why a failing seed printed by CI can be replayed
+locally with `LEDGER_X_SEED`.
 
 Cost grows superlinearly with operations per case, because every operation re-audits and re-renders the whole journal:
 that is the price of checking invariants after *every* step instead of at the end, and it is the right trade for a
@@ -365,23 +372,60 @@ CI-budget fog.
 
 ## 11. Verification
 
-- `./build.sh` locally, end to end: lint over 36 files including the two self-tested ADR rules, 13 main and 11 test
-  sources compiled, `PASS 5/5 substrate checks` (`platformThreads=8`), `PASS 9/9 property checks`.
-- `make demo` locally: nine events, Σ balances 0.00, the escrow account at −26.55 flagged `UNNATURAL for ASSET`, two
-  refusals proved to have changed nothing, `demo ok`.
-- `make campaign` locally: `PASS 9/9` at 60,000 operations.
-- **The local compiler is not the check of record.** No JDK is installable in this sandbox, so the local runs go
-  through `scripts/bootstrap-toolchain.sh`: a Temurin 21 *runtime* from a PyPI wheel and the Eclipse JDT batch
-  compiler from npm, with `java`/`javac` shims so that `./build.sh` itself — not a parallel script — is what ran.
-  `-Xlint:all -Werror` semantics therefore remain CI's call, and CI's javac run is the check of record.
-- **One divergence between the two compilers, found and designed around.** ECJ ignores
-  `@SuppressWarnings("unchecked")` once `-err:+unchecked` promotes the warning to an error, so a cast that javac
-  accepts does not compile locally. Nothing in `src/` depends on a suppression: the reflection in the audit check goes
-  through `Method.invoke` instead. Anyone reaching for an unchecked cast should know it will red-build locally and
-  green-build in CI, which is the worst of both.
-- CI evidence for this branch — run count, conclusions and the annotations the build publishes — is read back from the
-  API by `scripts/ci-evidence.sh` rather than hand-counted, because hand-counting went wrong once already (ADR 0001's
-  closeout records it).
+**CI, on this branch — the check of record.** Run [`34890770933`](https://github.com/sehaanurrahaman-creator/ledger-x/actions/runs/34890770933)
+(`pull_request`, head `59947f5`, `ubuntu-latest`, Temurin 21): **success**, 37 s end to end — `Build and test` 10 s,
+`Demo` 3 s, `Extended property campaign` 23 s. The annotations the build publishes, read back through the API:
+
+- `PASS 5/5 substrate checks`, `substrate contract measured platformThreads=10 platform threads`
+- `PASS 9/9 property checks — 127 random cases` (the default campaign)
+- `PASS 9/9 property checks — 307 random cases, 30344 accepted, 17946 rejected, 4153 refused at construction`
+  (`make campaign`, 60,000 operations)
+
+Two earlier runs on this branch failed, and both failures are recorded here rather than quietly fixed, because each
+one is a divergence between the toolchain this repository can verify with locally and the one that decides:
+
+1. **Run `34887589236` — lint, 11 s.** `selftest: the floating-point rule matched 0 of the 7 violations it must
+   match`. POSIX escape-processes the value of an `awk -v` assignment, so under **gawk** `\(` arrived as `(` and
+   `\.` as `.`: the rule's regexes stopped being the regexes that were written and the rule stopped matching
+   anything. **mawk** and **busybox awk** pass `-v` through untouched, so every local run was green and only CI was
+   red — reproduced here rather than guessed at, by handing the same fixtures the pattern as gawk's `-v` delivers it:
+   it does not even compile (`Value(` loses its escape, the paren goes unbalanced), where through `ENVIRON` it matches
+   7 of 7. Patterns now travel by environment variable, which is literal on all three implementations, and the
+   selftest gained a tripwire written to *discriminate*: its fixture line has no parentheses, so an intact
+   `\(double\)` matches nothing while an escape-stripped `(double)` matches the bare word and names `-v` in the
+   failure. The selftest is what made this a red build instead of a lint that silently checked nothing.
+2. **Run `34889657513` — the same failure**, which is what produced the change that made it readable: a failing step
+   now publishes its own first or last twelve lines as `::error` check annotations, because the runner's log lives
+   behind a blob URL (`results-receiver.actions.githubusercontent.com`) that is not reachable from every environment,
+   and annotations are the one CI channel readable back through the REST API. Without that change this failure was
+   undiagnosable from the sandbox; with it, the cause arrived as ten lines of JSON.
+
+Locally, the same commands, with the fallback toolchain described below:
+
+- `./build.sh` end to end: lint over 36 files including the two self-tested ADR rules, 13 main and 11 test sources
+  compiled, `PASS 5/5 substrate checks` (`platformThreads=8`), `PASS 9/9 property checks`.
+- `make demo`: nine events, Σ balances 0.00, the escrow account at −26.55 flagged `UNNATURAL for ASSET`, two refusals
+  proved to have changed nothing, `demo ok`.
+- `make campaign`: `PASS 9/9` at 60,000 operations, counters identical to CI's.
+- lint rule 7, both directions: appending `public double asDouble()` to `Money.java` fails the lint naming line 115 —
+  the one line it was injected at — and removing it passes; re-verified after the `-v` fix, under mawk and under
+  busybox awk.
+
+**The local compiler is still not the check of record, and CI has now said so in both directions.** No JDK is
+installable in this sandbox, so local runs go through `scripts/bootstrap-toolchain.sh`: a Temurin 21 *runtime* from a
+digest-pinned PyPI wheel and the Eclipse JDT batch compiler from npm, with `java`/`javac` shims so that `./build.sh`
+itself ran rather than a parallel script. `-Xlint:all -Werror` under javac was therefore unverified locally — and CI's
+javac accepted all 24 sources with no warnings, so the ECJ-compiled tree was not hiding a javac-only lint. That is a
+result, not an assumption: javac's `-Xlint:all` on JDK 21 includes checks ECJ does not make (`this-escape`, `serial`,
+`lossy-conversions`), and none of them fired.
+
+**One divergence between the two compilers, found and designed around.** ECJ ignores `@SuppressWarnings("unchecked")`
+once `-err:+unchecked` promotes the warning, so a cast that javac accepts does not compile locally. Nothing in `src/`
+depends on a suppression: the reflection in the audit check goes through `Method.invoke` instead. Anyone reaching for
+an unchecked cast should know it will red-build locally and green-build in CI, which is the worst of both.
+
+CI evidence for this branch is read back from the API by `scripts/ci-evidence.sh` rather than hand-counted, because
+hand-counting went wrong once already (ADR 0001's closeout records it).
 
 ## 12. Consequences accepted
 
