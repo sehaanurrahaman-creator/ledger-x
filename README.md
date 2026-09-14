@@ -18,6 +18,9 @@ $ ./build.sh
 It runs the style lint, compiles with `javac --release 21 -Xlint:all -Werror`, and runs the substrate contract
 test. `./build.sh lint` and `./build.sh clean` are the only other subcommands.
 
+The numbers the ADRs quote about CI — run counts, conclusions, the annotations this build publishes — are read back
+from the API by `scripts/ci-evidence.sh`, which needs `gh` and network and is therefore not part of the build.
+
 ## Decisions
 
 | ADR | Decision |
