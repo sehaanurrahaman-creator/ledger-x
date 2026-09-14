@@ -198,7 +198,9 @@ somebody made rather than an accident of what was handy.
 
 - **One command:** `./build.sh` — style lint, `javac --release 21 -Xlint:all -Werror`, compile tests, run the
   contract test, non-zero exit on any failure.
-- `.github/workflows/ci.yml` — `ubuntu-latest`, `actions/setup-java@v4` with Temurin 21, then `./build.sh`.
+- `.github/workflows/ci.yml` — `ubuntu-latest`, `actions/checkout@v7` and `actions/setup-java@v6` with Temurin 21,
+  then `./build.sh`, which is the only step: the whole verdict is one command, on one runner, with no third-party
+  artifact resolved from a registry.
 - `src/main/java/dev/ledgerx/substrate/DurableChannel.java` — the four primitives in the table above. It is
   substrate, not ledger: no accounts, no entries, no balances, no replay.
 - `src/test/java/dev/ledgerx/substrate/SubstrateContract.java` — five checks that pin down the platform facts this
@@ -225,9 +227,18 @@ somebody made rather than an accident of what was handy.
   RocksDB does expose `fdatasync` vs `fsync`; goroutines have no pinning trap; `PINNED` is still in the JDK on
   master.
 - Unchecked, and marked so: **Jaunt** — no public artifact by that name was found (see criterion 3).
-- The skeleton is verified by GitHub Actions on branch `arena/01a09264-ledger-x`: eight runs, every one
-  `completed/success`, the head one publishing `notice: PASS 5/5 substrate checks` and
-  `notice: substrate contract measured platformThreads=10 platform threads` (run `34653473125`). The
+- **CI is the check of record for the compile and the test, and it is green on `main`.** Merge commit
+  [`eda1ea5`](https://github.com/sehaanurrahaman-creator/ledger-x/commit/eda1ea510955b298c873976bac9c7b8c1b50a0e3)
+  — run `34838742618`, job *lint + build + test (Java 21)*, conclusion `success` — publishes its verdict as run
+  annotations: `notice: PASS 5/5 substrate checks` and
+  `notice: substrate contract measured platformThreads=10 platform threads`. Re-read from the API on 2026-09-14,
+  not assumed.
+- The branch that carried the decision, `arena/01a09264-ledger-x`, ran the same job eight times, every one
+  `completed/success`; the head pull-request run `34653473125` on `3e05793` carries the same two annotations. The
   virtual-thread claim in criterion 2 is therefore measured, not asserted: 10,000 concurrently-parked virtual
-  threads on 10 platform threads. Not verified locally — the sandbox this was written in has no JDK and no
-  reachable JDK download — so CI is the check of record for the compile and the test.
+  threads on 10 platform threads.
+- **Not verified locally, and that is a standing constraint.** The sandbox this was written in has no JDK and no
+  reachable JDK download — re-probed 2026-09-14: `api.adoptium.net` and `release-assets.githubusercontent.com`
+  both fail TLS from the sandbox, so `./build.sh` cannot run there. What *is* verifiable without a JVM is the style
+  lint (`./build.sh lint`, 8 files clean on the merged tree); everything else in this ADR is either CI-verified or
+  explicitly marked unchecked.
