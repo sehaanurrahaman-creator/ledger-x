@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   build:
-    name: lint + build + test (Java 21)
+    name: lint + build + test + demo (Java 21)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -26,5 +26,19 @@ jobs:
           distribution: temurin
           java-version: '21'
 
+      # One command, and it decides the verdict: the style lint (including the self-test of its
+      # own two ADR rules), javac --release 21 -Xlint:all -Werror, the substrate contract test
+      # and the domain model's property suite. It publishes both verdicts as run annotations.
       - name: Build and test
         run: ./build.sh
+
+      # The domain ticket's deliverable, run as a human would run it. The demo asserts what it
+      # prints — Σ balances = 0, the index equal to a fold of the log, a refused transaction
+      # that changed nothing — and exits non-zero if any of it is untrue.
+      - name: Demo
+        run: make demo
+
+      # The same properties at ~10x the operations, ~20s. Timing data for the map's CI-budget
+      # fog: this step is the expensive one and it is still cheap.
+      - name: Extended property campaign
+        run: make campaign
