@@ -21,6 +21,11 @@ test. `./build.sh lint` and `./build.sh clean` are the only other subcommands.
 The numbers the ADRs quote about CI — run counts, conclusions, the annotations this build publishes — are read back
 from the API by `scripts/ci-evidence.sh`, which needs `gh` and network and is therefore not part of the build.
 
+Environments with no JDK and no reachable JDK distribution (the Arena sandbox is one) can still compile and run the
+contract test: `scripts/bootstrap-toolchain.sh` fetches a digest-pinned Temurin 21 runtime from PyPI and the Eclipse
+JDT batch compiler from npm, then produces the same verdict with a different compiler. It is a fallback, not the
+build — CI's javac run stays the check of record.
+
 ## Decisions
 
 | ADR | Decision |
