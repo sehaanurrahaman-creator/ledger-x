@@ -49,9 +49,16 @@ fail() {
 
 # Prints "line:text" for every non-comment line matching the pattern. awk rather than grep so
 # that skipping comment lines does not lose the real line numbers.
+#
+# The pattern reaches awk through the environment and never through -v. POSIX escape-processes
+# a -v value, so under gawk '\(' arrives as '(' and these stop being the regexes that were
+# written: the floating-point rule then fails to compile at all, and the build goes red on the
+# selftest rather than silently linting nothing. mawk and busybox awk pass -v through untouched,
+# which is why this only ever showed up in CI. ENVIRON values are literal on all three.
 matches() {
   local file="$1" pattern="$2"
-  LC_ALL=C awk -v skip="${COMMENT_LINE}" -v pat="${pattern}" '
+  LC_ALL=C LX_SKIP="${COMMENT_LINE}" LX_PAT="${pattern}" awk '
+    BEGIN { skip = ENVIRON["LX_SKIP"]; pat = ENVIRON["LX_PAT"] }
     $0 ~ skip { next }
     $0 ~ pat { printf "%d:%s\n", FNR, $0 }
   ' "${file}"
@@ -92,6 +99,15 @@ selftest() {
   if [ "${hits}" -ne 0 ]; then
     fail "selftest: the floating-point rule matched ${hits} line(s) of prose it must not"
     matches "${tmp}/MustNotMatch.java" "${FLOATING_POINT}" | sed 's/^/         matched /' >&2
+  fi
+
+  # Tripwire for the escape-processing bug above, and it is written to *discriminate*: this
+  # line has no parentheses, so an intact \(double\) matches nothing while an escape-stripped
+  # (double) matches the bare word. "0 of 7" says something broke; this says what.
+  printf '%s\n' 'x = double y;' > "${tmp}/RoundTrip.java"
+  hits="$(matches "${tmp}/RoundTrip.java" '\(double\)' | grep -c . || true)"
+  if [ "${hits}" -ne 0 ]; then
+    fail "selftest: awk mangled the regex it was given — patterns must not travel by -v"
   fi
 
   printf '%s\n' \
