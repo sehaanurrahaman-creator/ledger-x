@@ -199,8 +199,8 @@ somebody made rather than an accident of what was handy.
 - **One command:** `./build.sh` — style lint, `javac --release 21 -Xlint:all -Werror`, compile tests, run the
   contract test, non-zero exit on any failure.
 - `.github/workflows/ci.yml` — `ubuntu-latest`, `actions/checkout@v7` and `actions/setup-java@v6` with Temurin 21,
-  then `./build.sh`, which is the only step: the whole verdict is one command, on one runner, with no third-party
-  artifact resolved from a registry.
+  then one build step: `./build.sh`. Three steps in total, one of which decides the verdict — one command, one
+  runner, no third-party artifact resolved from a registry.
 - `src/main/java/dev/ledgerx/substrate/DurableChannel.java` — the four primitives in the table above. It is
   substrate, not ledger: no accounts, no entries, no balances, no replay.
 - `src/test/java/dev/ledgerx/substrate/SubstrateContract.java` — five checks that pin down the platform facts this
@@ -233,12 +233,16 @@ somebody made rather than an accident of what was handy.
   annotations: `notice: PASS 5/5 substrate checks` and
   `notice: substrate contract measured platformThreads=10 platform threads`. Re-read from the API on 2026-09-14,
   not assumed.
-- The branch that carried the decision, `arena/01a09264-ledger-x`, ran the same job eight times, every one
-  `completed/success`; the head pull-request run `34653473125` on `3e05793` carries the same two annotations. The
-  virtual-thread claim in criterion 2 is therefore measured, not asserted: 10,000 concurrently-parked virtual
-  threads on 10 platform threads.
+- The branch that carried the decision, `arena/01a09264-ledger-x`, ran the same job **twelve times — eight push
+  runs and four pull-request runs across its eight commits — and every one is `completed/success`** (counted from
+  `/actions/runs?branch=…`, 2026-09-14). The last of them, pull-request run `34653631291` on `5353360`, carries the
+  same two annotations as the earlier `34653473125` on `3e05793`. The virtual-thread claim in criterion 2 is
+  therefore measured, not asserted: 10,000 concurrently-parked virtual threads on 10 platform threads.
 - **Not verified locally, and that is a standing constraint.** The sandbox this was written in has no JDK and no
   reachable JDK download — re-probed 2026-09-14: `api.adoptium.net` and `release-assets.githubusercontent.com`
   both fail TLS from the sandbox, so `./build.sh` cannot run there. What *is* verifiable without a JVM is the style
   lint (`./build.sh lint`, 8 files clean on the merged tree); everything else in this ADR is either CI-verified or
   explicitly marked unchecked.
+- **Every number in this section is reproducible, not remembered:** `scripts/ci-evidence.sh` prints the run counts,
+  conclusions and annotations above from the API. Run it before quoting a run id. It is a developer tool and
+  deliberately *not* part of `./build.sh`, which must stay free of network access and third-party binaries.

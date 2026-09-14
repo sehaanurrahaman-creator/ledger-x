@@ -12,11 +12,11 @@ Probed 2026-09-11 from session `arena/01a09264-ledger-x` as `arena-ai-coding-age
 
 | Action | Call | Result |
 | --- | --- | --- |
-| Push the branch | `git push origin arena/01a09264-ledger-x` | **done** — 4 commits, `contents=write` present |
-| Run CI on it | GitHub Actions, `.github/workflows/ci.yml` | **done** — 8 runs across the 6 commits, every one `completed/success` |
-| Read the CI verdict | check-run annotations API | **done** — `notice: PASS 5/5 substrate checks` and `notice: substrate contract measured platformThreads=10 platform threads` on check run `103440679530` |
+| Push the branch | `git push origin arena/01a09264-ledger-x` | **done** — 8 commits, `contents=write` present |
+| Run CI on it | GitHub Actions, `.github/workflows/ci.yml` | **done** — 12 runs (8 pushes, 4 pull requests) across those 8 commits, every one `completed/success` |
+| Read the CI verdict | check-run annotations API | **done** — `notice: PASS 5/5 substrate checks` and `notice: substrate contract measured platformThreads=10 platform threads` on check run `103440679530`, and again on `main` |
 | Create the graduated fog tickets | `POST /repos/{owner}/{repo}/issues` | **done** → [#17](https://github.com/sehaanurrahaman-creator/ledger-x/issues/17), [#18](https://github.com/sehaanurrahaman-creator/ledger-x/issues/18) |
-| Attach them to the map | GraphQL `addSubIssue` × 2 | **done** — both appear under #1's sub-issues (17 children now) |
+| Attach them to the map | GraphQL `addSubIssue` × 2 | **done** — both appear under #1's sub-issues (16 children now) |
 | Wire the blocking edges | GraphQL `addBlockedBy` × 4 | **done** — `#17 blockedBy=[3] blocking=[13]`, `#18 blockedBy=[3] blocking=[11]` |
 | Open a pull request | `gh pr create` | **done** — see the link at the foot of this file |
 | Claim by self-assigning | `POST …/issues/3/assignees`; `PATCH …/issues/3`; GraphQL `addAssigneesToAssignable` | **blocked** — 403 × 2, plus the bot is not assignable at all |
@@ -63,6 +63,18 @@ maintainer's write, not this integration's. That gets the ticket to `closed/comp
 record; it does not post the resolution comment, so §2 is still worth running if the comment is wanted on the
 ticket.
 
+**Numbers corrected in that pass.** Four claims written on 2026-09-11 were hand-counted and wrong: the branch carried
+8 commits (not 4), the workflow ran 12 times across them (not 8, and not "across the 6 commits"), every one
+`success`, and the map has 16 sub-issues (not 17). Corrected here, in the ADR, and in the resolution comment.
+`scripts/ci-evidence.sh` now prints these counts from the API so nobody hand-counts them again.
+
+**Commit hygiene for the next session.** The sandbox injects `.git/hooks/commit-msg`, which appends
+`Co-authored-by: arena-agent <…>` to every commit message. That trailer must not reach this repository: the only
+contributor is `sehaanurrahaman-creator`. Commit with `git commit --no-verify` (or amend and strip the trailer
+before pushing) and confirm with
+`git log --format='%an [%(trailers:key=Co-authored-by,valueonly)]'` that the author is
+`sehaanurrahaman-creator` and the trailer list is empty.
+
 ---
 
 ## 0. Fastest route (no `issues:write` needed)
@@ -106,13 +118,21 @@ Insert as the last lines under `## Decisions so far` in issue #1, keeping the HT
 owed from the previous ticket's closeout (that ticket was closed by the maintainer without its line ever being
 appended, and its payload is unchanged); the second is this ticket's.
 
-```
+**Paste-ready:** replace issue #1's entire `## Decisions so far` section (heading through the blank line before
+`## Not yet specified`) with the block below — it is the section as it should read once both lines are in, so the
+edit is one paste with nothing to insert in the right place.
+
+````
+## Decisions so far
+
+<!-- Append one line per closed ticket, newest last: - [ticket title](link): one-line gist of the answer. Nothing lives here until the first ticket closes. -->
+
 - [What do Stripe's public API and engineering writing actually say about idempotency and payout safety?](https://github.com/sehaanurrahaman-creator/ledger-x/issues/2): Stripe's guarantee is `(account, key) → stored status+body` for a **≥24h floor** after which the key is *forgotten and re-executes*, replays are flagged by `Idempotent-Replayed: true`, and **same-key/different-body is 400 `idempotency_error` while 409 `idempotency_key_in_use` means a concurrent duplicate that Stripe's own client retries** — so ledger-x's charter 409-on-mismatch and its GC policy are both deliberate divergences to justify; payouts can read `paid` and regress to `failed` within 5 business days. Note: `docs/research/stripe-idempotency.md`.
 - [Substrate decision: Java + Loom or Go — and a hand-rolled log or RocksDB?](https://github.com/sehaanurrahaman-creator/ledger-x/issues/3): **Java 21 with virtual threads, on a hand-rolled append-only WAL owned by this repo** — RocksDB rejected because it owns the WAL record format, the group-commit boundary and the recovery rules, which are the three things this project exists to decide; Go rejected because TLC is a Java program and the spec would leave the language. Commit = the group's `FileChannel.force(false)` (`fdatasync`) has returned; `force(true)` (`fsync`) only at open/rotate/checkpoint, plus an `fsync` of the WAL directory. Ships a green CI skeleton: `./build.sh` — lint, `javac --release 21 -Xlint:all -Werror`, and a five-check substrate contract test, no third-party dependencies. Note: `docs/adr/0001-substrate.md`.
-```
+````
 
-The full replacement body used for the (refused) `PATCH` was built by inserting those two lines after the HTML
-comment in the current body of #1, changing nothing else.
+The full replacement body used for the (refused) `PATCH` was built from exactly that block, changing nothing else in
+#1.
 
 ## 5. Fog graduated (done)
 
