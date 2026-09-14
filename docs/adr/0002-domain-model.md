@@ -14,7 +14,7 @@
   refund to the same account never interleave?*); the payout state machine; reconciliation; and whether ledger-x is a
   library or a service. Each of those reads a decision made here; none of them is made here.
 
-## Decision
+## 1. Decision
 
 | Question the ticket left open | Decision |
 | --- | --- |
@@ -28,7 +28,7 @@
 
 Everything below is the reasoning, including where the alternatives were stronger.
 
-## Money: integer minor units in a `long`, one currency, overflow-checked
+## 2. Money: integer minor units in a `long`, one currency, overflow-checked
 
 The map already ruled out the interesting half of this — *Out of scope* says "Multi-currency / FX — one currency,
 integer minor units" — so the decision left is what "integer minor units" means in code, and what happens at the
@@ -77,7 +77,7 @@ against lines that must match and lines that must not, every invocation — and 
 this ADR: injecting `public double asDouble() { return (double) minorUnits / 100.0d; }` into `Money.java` fails the
 lint naming lines 78 and 79, and removing it passes.
 
-## Entries: the side is data, and the amount is always positive
+## 3. Entries: the side is data, and the amount is always positive
 
 An `Entry` is `(AccountId, Side, Money)` with `Side ∈ {DEBIT, CREDIT}` and a **strictly positive** amount. An
 account's balance is Σ debits − Σ credits on one signed axis, debit-positive, so Σ over all accounts is 0 exactly
@@ -101,7 +101,7 @@ same rule for posted transactions: "In order to undo the effect of a posted Ledg
 write a second reversing Ledger Transaction"
 ([Ledger Transactions Overview](https://docs.moderntreasury.com/ledgers/docs/ledger-transactions-overview)).
 
-## Accounts: three kinds, and none of them constrains anything
+## 4. Accounts: three kinds, and none of them constrains anything
 
 `AccountKind` is `ASSET`, `LIABILITY`, `EQUITY`, each carrying the side that normally increases it — debit for an
 asset, credit for a liability and for equity. That is the standard normal-balance table, and it matches what a
@@ -135,7 +135,7 @@ other half of that claim: all 20 delimiters its canonical rendering uses are cha
 `AccountId` deliberately carries **no merchant or tenant scope**, and that is fog rather than an oversight — see
 *Fog graduated*.
 
-## Negativity: balances may go negative on every kind
+## 5. Negativity: balances may go negative on every kind
 
 The ticket asks directly whether balances may go negative. **They may, on any account of any kind, and the ledger
 accepts the posting.** Three reasons, in the order they decided it:
@@ -170,7 +170,7 @@ charter rules out: entries are append-only, so there is no "pending entry" that 
 divergence is real, it is a consequence of the charter rather than an oversight, and it belongs in `STRIPE-DIFFS.md`
 alongside the idempotency divergences the Stripe research ticket already recorded.
 
-## The transaction grammar: n entries
+## 6. The transaction grammar: n entries
 
 A transaction is a list of entries that must all be appended or none. The rules, in the order the ledger evaluates
 them:
@@ -205,7 +205,7 @@ transaction with two entries, one unit of commit. What is left for the cross-sha
 how one record stays atomic when the accounts it names live on different shards — not a protocol question about two
 accounts agreeing. `make demo` prints exactly that transaction, and says so.
 
-## Atomic rejection: validate, then apply what validation checked
+## 7. Atomic rejection: validate, then apply what validation checked
 
 `InMemoryLedger.post` is two steps. `validate` runs every rule against immutable state and returns the per-account
 deltas it range-checked; `apply` appends the event and adds exactly those deltas, one addition per touched account.
@@ -239,7 +239,7 @@ have nothing to say about it, and every layer above already has an error path to
 handle; the exception's `attempted()` returns the candidate so a rejection can be logged or answered with the thing
 that caused it.
 
-## One event log, two event kinds
+## 8. One event log, two event kinds
 
 The log holds `AccountOpened` and `Posted` in **one** `sealed interface JournalEvent`. Account openings move no money
 and could have lived in a second list beside the journal — but then there would be two sequence spaces, and replay
@@ -286,7 +286,7 @@ lock here would either be that global lock or a lie about isolation the concurre
 it decides, an `InMemoryLedger` is confined to the thread that created it and the property suite is single-threaded by
 construction.
 
-## Property-based testing without a dependency manager
+## 9. Property-based testing without a dependency manager
 
 The ticket says "property-based tests (toolkit per ADR-0001)", and ADR 0001 says: zero third-party dependencies, with
 an explicit trigger — "the first ticket that needs JMH or JUnit (the metrics ticket) introduces a dependency-managing
@@ -334,7 +334,7 @@ acceptance, one construction refusal, one rejection for each of the five reasons
 entries, a negative balance, a same-account-twice posting and a self-cancelling one. That check fails loudly with the
 coverage counters in the message.
 
-## What the suite asserts, and what it measured
+## 10. What the suite asserts, and what it measured
 
 Nine checks, run by `./build.sh`, ~3 s at default size on this sandbox's fallback toolchain:
 
@@ -363,7 +363,7 @@ that is the price of checking invariants after *every* step instead of at the en
 prototype whose only job is to be correct. Those three timings are also the first real data points for the map's
 CI-budget fog.
 
-## Verification
+## 11. Verification
 
 - `./build.sh` locally, end to end: lint over 36 files including the two self-tested ADR rules, 13 main and 11 test
   sources compiled, `PASS 5/5 substrate checks` (`platformThreads=8`), `PASS 9/9 property checks`.
@@ -383,7 +383,7 @@ CI-budget fog.
   API by `scripts/ci-evidence.sh` rather than hand-counted, because hand-counting went wrong once already (ADR 0001's
   closeout records it).
 
-## Consequences accepted
+## 12. Consequences accepted
 
 - **One currency, no code stored.** `Money` has no currency field, so a second currency is a record-format change and
   not a type change — and every balance object in the system would need one. Accepted because the map puts
@@ -402,7 +402,7 @@ CI-budget fog.
 - **Not thread-safe.** Confinement is documented, not enforced; the concurrency ticket owns the answer and inherits a
   class with no lock in it, which is the point.
 
-## What this changes for other tickets
+## 13. What this changes for other tickets
 
 - *What does a durable write look like?* — inherits two event kinds to encode, a transaction with no id and no
   timestamp (so both come from the record, if at all), an `AccountId` alphabet that needs no escaping, and an entry
@@ -435,7 +435,7 @@ CI-budget fog.
 - *What did Stripe teach us, and what breaks at 10M merchants?* — two divergences to argue in `STRIPE-DIFFS.md`: no
   `available_balance`/pending-posted split, and no merchant scope on an account id.
 
-## Fog graduated
+## 14. Fog graduated
 
 One new decision, and it is genuinely new rather than a restatement: **does an account belong to a merchant, and where
 does that scope live?** `AccountId` is unscoped, the idempotency ticket's key is `(merchant_id, idempotency_key)`, and

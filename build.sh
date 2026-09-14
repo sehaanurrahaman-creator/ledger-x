@@ -69,11 +69,15 @@ compile() {
     exit 1
   fi
   rm -rf "${out}"
-  mkdir -p "${out}"
-  if [ -n "${cp}" ]; then
-    javac "${JAVAC_FLAGS[@]}" -cp "${cp}" -d "${out}" "${sources[@]}"
-  else
-    javac "${JAVAC_FLAGS[@]}" -d "${out}" "${sources[@]}"
+  mkdir -p "${out}" "${BUILD_DIR}"
+  local args=("${JAVAC_FLAGS[@]}")
+  if [ -n "${cp}" ]; then args+=(-cp "${cp}"); fi
+  args+=(-d "${out}" "${sources[@]}")
+  local javac_log="${BUILD_DIR}/javac.log" status=0
+  if ! javac "${args[@]}" 2>&1 | tee "${javac_log}"; then status=1; fi
+  if [ "${status}" -ne 0 ]; then
+    annotate_failure "javac ${src}" "${javac_log}" head
+    exit 1
   fi
   echo "${#sources[@]} source file(s) -> ${out}"
 }
@@ -85,7 +89,13 @@ do_clean() {
 
 do_lint() {
   log "lint"
-  scripts/lint.sh
+  mkdir -p "${BUILD_DIR}"
+  local lint_log="${BUILD_DIR}/lint.log" status=0
+  if ! scripts/lint.sh 2>&1 | tee "${lint_log}"; then status=1; fi
+  if [ "${status}" -ne 0 ]; then
+    annotate_failure "lint" "${lint_log}" head
+    exit 1
+  fi
 }
 
 do_compile() {
@@ -105,10 +115,34 @@ run_main() {
   if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
     printf '### %s\n\n```\n' "${name}" >> "${GITHUB_STEP_SUMMARY}"
   fi
-  java "${JAVA_OPTS[@]}" "$@" -cp "${MAIN_OUT}:${TEST_OUT}" "${entry}" | tee "${log_file}"
+  local status=0
+  if ! java "${JAVA_OPTS[@]}" "$@" -cp "${MAIN_OUT}:${TEST_OUT}" "${entry}" \
+    | tee "${log_file}"; then
+    status=1
+  fi
   if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
     printf '```\n' >> "${GITHUB_STEP_SUMMARY}"
   fi
+  if [ "${status}" -ne 0 ]; then
+    annotate_failure "${name}" "${log_file}" tail
+    exit "${status}"
+  fi
+}
+
+# A failing step publishes its own diagnostics as check annotations, because the runner's log
+# lives behind a blob URL that scripts/ci-evidence.sh cannot fetch — annotations are the one CI
+# channel readable back through the REST API. 'head' for compiler diagnostics, which come first;
+# 'tail' for a failed test, whose detail is printed last.
+annotate_failure() {
+  local what="$1" log_file="$2" mode="${3:-head}" title line pick
+  [ "${GITHUB_ACTIONS:-}" = "true" ] || return 0
+  [ -f "${log_file}" ] || return 0
+  title="$(printf '%s' "${what}" | sed 's/[^A-Za-z0-9._-]/-/g' | cut -c1-60)"
+  if [ "${mode}" = "tail" ]; then pick="tail -n 12"; else pick="head -n 12"; fi
+  while IFS= read -r line; do
+    line="$(printf '%s' "${line}" | sed 's/%/%25/g' | cut -c1-300)"
+    echo "::error title=${title}::${line}"
+  done < <(grep -v '^[[:space:]]*$' "${log_file}" | ${pick})
 }
 
 # The verdict line is the last line of the log; annotations have a length limit, so it is cut.
