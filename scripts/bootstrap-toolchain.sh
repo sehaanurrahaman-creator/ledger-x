@@ -4,18 +4,33 @@
 #
 # This is NOT the build. `./build.sh` remains the one command and still requires nothing but
 # a JDK 21 — see ADR 0001. This script exists for the case the Arena sandbox hit: no JDK on
-# PATH, and every JDK distribution host blocked by the network allowlist, so only the package
-# registries are reachable. It assembles a working compiler + runtime from two of them:
+# PATH, and every JDK distribution host blocked by the network allowlist (verified again on
+# 2026-09-14: repo1.maven.org and api.adoptium.net both fail the TLS handshake, while pypi.org
+# and registry.npmjs.org answer), so only the package registries are reachable. It assembles a
+# working compiler + runtime from two of them:
 #
 #   JRE      jdk4py 21.0.8.2 (manylinux x86_64 wheel)  -> Temurin 21.0.8 runtime from PyPI
 #   compiler Eclipse JDT batch compiler (ECJ) 3.45.0   -> from the npm package
 #                                                        @vscjava/java-language-server
 #
 # It then compiles src/main and src/test and runs the substrate contract test, which is the
-# same verdict `./build.sh` produces — but by a *different* compiler. Two caveats, stated so
-# nobody over-reads the result: ECJ is not javac, so its lint token set is not identical
-# (`-err:+unused` is stricter than `-Xlint:all`; `-Xlint:all -Werror` semantics remain CI's
-# call), and the runtime here is a JRE, so it can compile and run but not build a JDK image.
+# same verdict `./build.sh` produces — but by a *different* compiler.
+#
+# It also installs `java` and `javac` shims into build/toolchain/bin/, so that the real build
+# can run here too:
+#
+#   scripts/bootstrap-toolchain.sh
+#   PATH="$PWD/build/toolchain/bin:$PATH" ./build.sh        # lint, compile, both test mains
+#   PATH="$PWD/build/toolchain/bin:$PATH" make demo
+#
+# The `javac` shim translates the flags build.sh passes into ECJ's vocabulary: `-Xlint:all
+# -Werror` becomes `-err:+<the tokens ECJ has equivalents for>`. Two caveats, stated so nobody
+# over-reads a green local run: ECJ is not javac, so a warning javac has and ECJ does not
+# (`-Xlint:this-escape`, `-Xlint:serial`) will only ever appear in CI — CI's javac run remains
+# the check of record; and the runtime here is a JRE, so it can compile and run but not build
+# a JDK image. The reverse divergence is real too and was hit on 2026-09-14: ECJ ignores
+# `@SuppressWarnings("unchecked")` once `-err:+unchecked` promotes the warning, so code that
+# javac would accept does not compile locally. Nothing in src/ depends on a suppression.
 #
 #   scripts/bootstrap-toolchain.sh          fetch (if needed), compile, run the contract test
 #   scripts/bootstrap-toolchain.sh --clean  remove the fetched toolchain
@@ -27,6 +42,10 @@ set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
+# Absolute, and captured after the cd above: the shims this script writes must work no matter
+# what directory something invokes them from, and a relative path in a shim only works from
+# the repository root.
+readonly ROOT="${PWD}"
 readonly TOOLCHAIN_DIR="build/toolchain"
 readonly JRE_DIR="${TOOLCHAIN_DIR}/jre"
 readonly ECJ_DIR="${TOOLCHAIN_DIR}/ecj"
@@ -119,6 +138,31 @@ echo "  ${ECJ}"
 
 sources() { find "$1" -name '*.java' | sort; }
 
+log "install java/javac shims so ./build.sh itself can run here"
+mkdir -p "${TOOLCHAIN_DIR}/bin"
+cat > "${TOOLCHAIN_DIR}/bin/java" <<SHIM
+#!/usr/bin/env bash
+exec "${ROOT}/${JRE_DIR}/bin/java" "\$@"
+SHIM
+cat > "${TOOLCHAIN_DIR}/bin/javac" <<SHIM
+#!/usr/bin/env bash
+# Translates build.sh's javac invocation into ECJ's vocabulary. --release, -encoding, -cp,
+# -d and the source list pass through unchanged; -Xlint:all -Werror becomes the closest set
+# of ECJ error promotions. It is an approximation and CI's javac remains the check of record.
+args=()
+for arg in "\$@"; do
+  case "\$arg" in
+    -Xlint:all|-Werror) ;;
+    *) args+=("\$arg") ;;
+  esac
+done
+exec "${ROOT}/${JRE_DIR}/bin/java" -jar "${ROOT}/${ECJ_DIR}/${ECJ_JAR}" ${ECJ_LINT} "\${args[@]}"
+SHIM
+chmod +x "${TOOLCHAIN_DIR}/bin/java" "${TOOLCHAIN_DIR}/bin/javac"
+echo "  ${TOOLCHAIN_DIR}/bin/java"
+echo "  ${TOOLCHAIN_DIR}/bin/javac  (ECJ, -Xlint:all -Werror -> ${ECJ_LINT})"
+echo "  run the real build with: PATH=\"\$PWD/${TOOLCHAIN_DIR}/bin:\$PATH\" ./build.sh"
+
 log "compile src/main (ECJ ${ECJ_LINT})"
 rm -rf "${MAIN_OUT}"
 mkdir -p "${MAIN_OUT}"
@@ -134,6 +178,6 @@ mkdir -p "${TEST_OUT}"
   -d "${TEST_OUT}" $(sources src/test/java)
 
 log "run the substrate contract test (the ./build.sh verdict, by another compiler)"
-"${JAVA}" -cp "${MAIN_OUT}:${TEST_OUT}" "${MAIN_ENTRY}"
+"${JAVA}" -Dstdout.encoding=UTF-8 -cp "${MAIN_OUT}:${TEST_OUT}" "${MAIN_ENTRY}"
 
 log "done — CI's javac run remains the check of record for -Xlint:all -Werror"
