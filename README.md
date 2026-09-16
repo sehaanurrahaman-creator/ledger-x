@@ -1,6 +1,7 @@
 # ledger-x
 
-A double-entry ledger where exactly-once money movement under crashes is implemented and proved, not asserted:
+A double-entry ledger where exactly-once money movement under crashes is implemented and proved, not
+asserted:
 deterministic byte-identical replay after any crash, a TLC-checked TLA⁺ spec, a chaos campaign, and honest
 latency numbers per fsync policy.
 
@@ -15,13 +16,14 @@ One command, no third-party dependencies — a JDK 21 or newer is the only requi
 $ ./build.sh
 ```
 
-It runs the style lint, compiles with `javac --release 21 -Xlint:all -Werror`, runs the substrate contract test and
-runs the domain model's property suite. The other subcommands, and the `make` targets that delegate to them:
+It runs the style lint, compiles with `javac --release 21 -Xlint:all -Werror`, runs the substrate
+contract test, the durable-write contract, and the domain model's property suite. The other subcommands, and the `make` targets that delegate to them:
 
 | Command | Make target | What it does |
 | --- | --- | --- |
 | `./build.sh` | `make` | lint, compile, both test mains — the verdict |
 | `./build.sh demo` | `make demo` | post a two-account transfer and print the balances and the ledger |
+| `./build.sh crash` | `make crash` | the kill -9 micro-harness: 1,000 random kill/recover cycles across the fsync menu |
 | `./build.sh campaign` | `make campaign` | the property suite at ~10x the campaign CI runs by default |
 | `./build.sh compile` | `make compile` | lint and compile, run nothing |
 | `./build.sh lint` | `make lint` | the style lint, including the self-test of its two ADR rules |
@@ -29,6 +31,12 @@ runs the domain model's property suite. The other subcommands, and the `make` ta
 
 A failing property prints the seed that produced it and the shrunk case, and can be replayed without editing
 anything: `LEDGER_X_SEED=20260921 make test`, or `make campaign TRIALS=400 OPERATIONS=600` for a longer hunt.
+
+The crash harness is sized the same way — `make crash CYCLES=5000 OPS=200` — and prints a per-policy
+table (acks observed, acknowledged-then-lost under each fsync policy, cycles whose tail was torn, bytes
+cut, recovery markers written) into the CI job summary. Its child processes are forked with
+`-Djdk.tracePinnedThreads=full`, because ADR 0001's pinning rule is a durability fact on this
+substrate and the harness treats a pinned thread as a failed cycle.
 
 `make demo` prints a ledger being used: four accounts, a two-account transfer, a three-entry transaction, two
 transactions refused atomically, the whole journal, and every balance — with Σ balances = 0 asserted before it is
@@ -49,13 +57,24 @@ It is a fallback, not the build: ECJ's lint vocabulary is not javac's, so CI's j
 | --- | --- |
 | [0001 — Substrate](docs/adr/0001-substrate.md) | Java 21 with virtual threads, and a hand-rolled append-only WAL; no storage engine dependency |
 | [0002 — Domain model](docs/adr/0002-domain-model.md) | n-entry transactions with Σ debits = Σ credits, three account kinds as metadata, balances may go negative, integer minor units in a `long`, one append-only event log, and rejection that changes nothing |
+| [0003 — Durable write](docs/adr/0003-wal-fsync.md) | 20 bytes of framing per record — length, dense LSN, type, payload, CRC32C over all four — and three fsync policies selectable per commit, with the ack rule that a commit is acknowledged only after the `force` covering its bytes returns. Recovery cuts at the first *structural* failure and records the cut in the log; a complete, CRC-valid frame it cannot honour makes it refuse to open instead |
 
 ## Status
 
-Substrate and domain model decided. `src/main` holds the durability primitives ADR 0001 rests on
-(`dev.ledgerx.substrate`), the in-memory double-entry ledger and its types (`dev.ledgerx.domain`), and the demo
-(`dev.ledgerx.demo`). `src/test` holds the five-check substrate contract and a nine-check property suite that runs
-random sequences of valid and invalid operations against an independent `BigInteger` model of the same rules.
+Substrate, domain model and the durable write are decided. `src/main` holds the durability primitives
+ADR 0001 rests on (`dev.ledgerx.substrate`), the append-only log that owns the record format, the
+fsync menu and recovery (`dev.ledgerx.wal`, ADR 0003), the ledger wired onto that log
+(`dev.ledgerx.journal`), the in-memory double-entry model itself (`dev.ledgerx.domain`), and the demo
+(`dev.ledgerx.demo`). `src/test` holds the five-check substrate contract, the nineteen-check
+durable-write contract — exact frame bytes, 68 single-bit flips, every truncate offset of a log, the
+cut-versus-refuse split of the torn-tail rules, per-policy force counts — and the nine-check property
+suite that runs random sequences of valid and invalid operations against an independent `BigInteger`
+model of the same rules.
 
-Nothing is durable yet. The WAL record format, checkpoints and replay, idempotency, concurrency and the payout
-protocol are all still open tickets on the map.
+Money now survives a crash: `DurableLedger` validates a transaction, appends it, waits for the ack,
+and applies it, and `./build.sh crash` proves the contract against 1,000 real `SIGKILL`s — every
+acknowledged transaction was still in the log after recovery, under both crash models, with zero
+invariant violations. What is still open on the map: checkpoints and the byte-identical replay proof
+past the clean prefix, idempotency semantics, per-account concurrency, the payout protocol, the
+benchmark table, and the TLA⁺ spec.
+
