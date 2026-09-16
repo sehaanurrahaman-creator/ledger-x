@@ -34,7 +34,9 @@ a token rotation hunting a bug that is a scope setting.
 
 ## 0. Fastest route
 
-1. **Merge #23.** CI ran all four steps green on `d0d41aa` (run `35150070017`): lint over 56 files,
+1. **Merge #23** — `gh pr merge 23 --squash`, which is how #20 and #22 landed as well: this integration
+   *can* merge a pull request, it just cannot close the ticket that request resolves (§0 step 2, and
+   ADR 0001's closeout table). CI ran all four steps green on `d0d41aa` (run `35150070017`): lint over 56 files,
    `javac --release 21 -Xlint:all -Werror`, `PASS 5/5 substrate checks`, **`PASS 19/19 wal checks`**, the
    demo, **`PASS 1000/1000 kill -9 cycles — zero invariant violations, zero acked-but-lost forced
    transactions; unforced acks lost across a power cut: 284`**, and `PASS 9/9 property checks` at both
