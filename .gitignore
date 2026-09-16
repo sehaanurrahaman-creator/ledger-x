@@ -15,3 +15,6 @@ replay_pid*.log
 *.iml
 .vscode/
 .DS_Store
+
+# Local harness and toolchain logs; build.sh writes its own under build/
+/*.log
