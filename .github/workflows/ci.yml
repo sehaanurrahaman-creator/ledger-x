@@ -38,6 +38,12 @@ jobs:
       - name: Demo
         run: make demo
 
+      # ADR 0003's evidence: fork a durable ledger, SIGKILL it at a random instant, recover, and
+      # compare the log against what was acknowledged. 1,000 cycles across the fsync menu and both
+      # crash models; the step publishes its per-policy table into the job summary.
+      - name: Kill -9 micro-harness
+        run: make crash
+
       # The same properties at ~10x the operations, ~20s. Timing data for the map's CI-budget
       # fog: this step is the expensive one and it is still cheap.
       - name: Extended property campaign

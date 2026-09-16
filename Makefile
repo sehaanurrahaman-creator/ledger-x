@@ -1,6 +1,7 @@
 # ledger-x — the one command is ./build.sh; these targets are the ways of saying it.
 #
-#   make            lint, compile, run the substrate contract test and the domain properties
+#   make            lint, compile, run all three suites: substrate, WAL contract, properties
+#   make crash        the kill -9 micro-harness: 1,000 random kill/recover cycles
 #   make demo       post a two-account transfer and print the balances and the ledger
 #   make campaign   the property suite at ~10x the campaign CI runs
 #   make test       compile and run both test mains, nothing else
@@ -39,6 +40,11 @@ test:
 demo:
 	./build.sh demo
 
+crash:
+	LEDGER_X_CRASH_CYCLES="$(or $(CYCLES),)" \
+	LEDGER_X_CRASH_OPS="$(or $(OPS),)" \
+	./build.sh crash
+
 campaign:
 	$(CAMPAIGN_ENV) ./build.sh campaign
 
@@ -48,4 +54,4 @@ lint:
 clean:
 	./build.sh clean
 
-.PHONY: all compile test demo campaign lint clean
+.PHONY: all compile test demo crash campaign lint clean

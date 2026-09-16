@@ -2,8 +2,9 @@
 #
 # ledger-x — one command to build and test.
 #
-#   ./build.sh            lint, compile, run the substrate contract test and the properties
+#   ./build.sh            lint, compile, the substrate contract, the WAL contract, the properties
 #   ./build.sh compile    lint and compile, run nothing
+#   ./build.sh crash      the kill -9 micro-harness: 1,000 random kill/recover cycles per policy
 #   ./build.sh test       compile and run both test mains
 #   ./build.sh demo       compile and run the transfer demo — what `make demo` runs
 #   ./build.sh campaign   the property suite at a much larger campaign than CI runs
@@ -28,6 +29,8 @@ readonly BUILD_DIR="build"
 readonly MAIN_OUT="${BUILD_DIR}/classes/main"
 readonly TEST_OUT="${BUILD_DIR}/classes/test"
 readonly CONTRACT_ENTRY="dev.ledgerx.substrate.SubstrateContract"
+readonly WAL_CONTRACT_ENTRY="dev.ledgerx.wal.WalContract"
+readonly CRASH_ENTRY="dev.ledgerx.wal.crash.CrashHarness"
 readonly PROPERTIES_ENTRY="dev.ledgerx.domain.DomainModelProperties"
 readonly DEMO_ENTRY="dev.ledgerx.demo.TransferDemo"
 readonly JAVAC_FLAGS=(--release "${RELEASE}" -Xlint:all -Werror -encoding UTF-8)
@@ -40,6 +43,12 @@ readonly JAVA_OPTS=(-Dstdout.encoding=UTF-8 -Dstderr.encoding=UTF-8)
 # The extended campaign: ~10x the operations CI runs, still under a minute on a runner.
 readonly CAMPAIGN_TRIALS=150
 readonly CAMPAIGN_OPERATIONS=400
+
+# The crash harness, sized to the ticket's floor (>= 1,000 kill/recover cycles) and to a CI budget
+# of a couple of minutes: 1,000 cycles x 24 ops runs in ~3 min here. Override with the env, e.g.
+#   LEDGER_X_CRASH_CYCLES=5000 LEDGER_X_CRASH_OPS=200 ./build.sh crash
+readonly CRASH_CYCLES="${LEDGER_X_CRASH_CYCLES:-1000}"
+readonly CRASH_OPS="${LEDGER_X_CRASH_OPS:-24}"
 
 log() { printf '\n==> %s\n' "$*"; }
 
@@ -181,6 +190,12 @@ do_contract_test() {
   fi
 }
 
+do_wal_contract() {
+  local log_file="${BUILD_DIR}/wal-contract.log"
+  run_main "durable-write contract" "${WAL_CONTRACT_ENTRY}" "${log_file}"
+  annotate "${log_file}"
+}
+
 do_properties() {
   local log_file="${BUILD_DIR}/property-test.log"
   campaign_opts
@@ -199,7 +214,32 @@ do_demo() {
 
 do_test() {
   do_contract_test
+  do_wal_contract
   do_properties
+}
+
+do_crash() {
+  local log_file="${BUILD_DIR}/crash-harness.log"
+  log "kill -9 micro-harness: ${CRASH_CYCLES} cycles x ${CRASH_OPS} ops across the fsync menu"
+  local status=0
+  if ! java "${JAVA_OPTS[@]}" \
+    -Dledgerx.crash.cycles="${CRASH_CYCLES}" \
+    -Dledgerx.crash.ops="${CRASH_OPS}" \
+    -cp "${MAIN_OUT}:${TEST_OUT}" "${CRASH_ENTRY}" | tee "${log_file}"; then
+    status=1
+  fi
+  if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+    {
+      printf '### kill -9 micro-harness\n\n```\n'
+      grep -E "^  [a-z-]+ /|^  total:|^PASS|^FAIL" "${log_file}" || tail -n 20 "${log_file}"
+      printf '\n```\n'
+    } >> "${GITHUB_STEP_SUMMARY}"
+  fi
+  if [ "${status}" -ne 0 ]; then
+    annotate_failure "crash harness" "${log_file}" tail
+    exit 1
+  fi
+  annotate "${log_file}"
 }
 
 do_campaign() {
@@ -221,11 +261,12 @@ case "${1:-all}" in
   all)      require_java; do_build ;;
   compile)  require_java; do_compile ;;
   test)     require_java; do_compile; do_test ;;
+  crash)    require_java; do_compile; do_crash ;;
   demo)     require_java; do_compile; do_demo ;;
   campaign) require_java; do_compile; do_campaign ;;
   lint)     do_lint ;;
   clean)    do_clean ;;
-  *)        echo "usage: $0 [all|compile|test|demo|campaign|lint|clean]" >&2; exit 2 ;;
+  *)        echo "usage: $0 [all|compile|test|demo|crash|campaign|lint|clean]" >&2; exit 2 ;;
 esac
 
 log "done"
