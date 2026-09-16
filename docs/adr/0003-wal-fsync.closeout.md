@@ -4,9 +4,11 @@ The decision is recorded as [`docs/adr/0003-wal-fsync.md`](./0003-wal-fsync.md),
 `src/main/java/dev/ledgerx/wal/` and `src/main/java/dev/ledgerx/journal/`, and proved by
 `src/test/java/dev/ledgerx/wal/` (`WalContract`, 19 checks) and
 `src/test/java/dev/ledgerx/wal/crash/` (`CrashHarness`, 1,000 `kill -9` cycles). It is committed on
-branch `arena/01a0a4f8-ledger-x` as three commits — `315e06b` (the implementation and the two suites),
-`6d7db40` (this ADR, the README, and the harness's environment guard), and this file plus the
-resolution comment. It is pushed, and this branch's PR carries all three.
+branch `arena/01a0a4f8-ledger-x` as four commits — `315e06b` (the implementation and the two suites),
+`6d7db40` (this ADR, the README, and the harness's environment guard), this file plus the resolution
+comment, and `d0d41aa` (a one-word fix CI asked for, §6). **[PR #23](https://github.com/sehaanurrahaman-creator/ledger-x/pull/23)**
+carries all four and **CI is green on them** (run `35150070017`); the verdict lines are quoted in §6
+because a claim about CI that was not read back is not evidence.
 
 **Everything the ticket asked for is in those commits; what is left is GitHub-side writing this
 integration cannot do.** Two credentials lived and died mid-session, which is worth recording because
@@ -22,20 +24,23 @@ branch identical to `main`, so `gh pr create` answered `No commits between main 
 arena/01a0a4f8-ledger-x`. The rule this session learned is in §6.
 
 Two things the session measured rather than assumed, both written into the ADR rather than smoothed
-over: the issue-side writes are still refused to this integration (`POST …/issues/5/comments` answered
-`403 Resource not accessible by integration` when the token was otherwise working, and the repository
-permission object read `{"admin":false,"maintain":false,"pull":false,"push":false,"triage":false}` at
-the start of the session), which is why #5 will not close itself when its PR merges; and the claim
-comment in §1 was drafted for #5 and never posted for that reason.
+over: the issue-side writes are refused by *permission*, not by a dead token — after the credential
+recovered, `POST …/issues/5/comments` answered `403 Resource not accessible by integration` again while
+`GET …/issues/5` returned the ticket and `git push` returned `d0d41aa`, and the permission object still
+reads `{"admin":false,"maintain":false,"pull":false,"push":false,"triage":false}`. So #5 will not close
+itself when #23 merges, and the claim comment in §1 stays a payload file. The distinction is worth the
+sentence: reconnecting GitHub fixes pushes and not issue comments, and a future session should not spend
+a token rotation hunting a bug that is a scope setting.
 
 ## 0. Fastest route
 
-1. **Watch CI** on this branch's PR: `scripts/ci-evidence.sh` prints the verdict and, on a red run, the
-   first error line of every failing job. Four steps now — `Build and test` (lint, `javac --release 21
-   -Xlint:all -Werror`, substrate contract, **durable-write contract**, properties), `Demo`, **`Kill -9
-   micro-harness`** (`make crash`, 1,000 cycles, ~2.5 min measured on a loaded runner), `Extended
-   property campaign`. Locally green under ECJ only, so CI's javac run is the check of record for
-   `-Xlint:all -Werror` semantics (§6).
+1. **Merge #23.** CI ran all four steps green on `d0d41aa` (run `35150070017`): lint over 56 files,
+   `javac --release 21 -Xlint:all -Werror`, `PASS 5/5 substrate checks`, **`PASS 19/19 wal checks`**, the
+   demo, **`PASS 1000/1000 kill -9 cycles — zero invariant violations, zero acked-but-lost forced
+   transactions; unforced acks lost across a power cut: 284`**, and `PASS 9/9 property checks` at both
+   campaign sizes. The crash step fits the budget: the whole job finished in under four minutes.
+   `scripts/ci-evidence.sh <branch>` is the way to read any of that back, and it is the tool that turned
+   "CI failed" into the one-line `[serial]` diagnosis in §6.
 2. **Merge it.** The PR body is [`0003-wal-fsync.resolution-comment.md`](./0003-wal-fsync.resolution-comment.md)
    verbatim, so add one line saying that merging will *not* close #5: this integration has no
    `issues: write`, and a `Closes #5` in a body silently no-ops for an App that cannot write issues.
@@ -111,6 +116,16 @@ format is per-file self-describing and the LSN stream is continuous so that rota
 **Locally, with the fallback toolchain** (`scripts/bootstrap-toolchain.sh`: Temurin 21.0.8 runtime +
 Eclipse JDT batch compiler, since no JDK distribution host is reachable from this sandbox):
 
+- **CI, read back rather than assumed:** the first run on this branch (`35149368720`) failed in 11 s
+  with a single warning — `[serial] non-transient instance field of a serializable class declared with a
+  non-serializable type` on `UnrecoverableLogException`'s `Lsn lsn` field. The log line came from
+  `gh api …/check-runs/<id>/annotations`, since `gh run view --log-failed` hit an `EOF` on the log
+  download; that endpoint is the fallback worth knowing. Fixed by marking the field `transient` (the
+  number a reader needs is already in the message, and records are serializable by definition, so
+  `Corruption` needed nothing), and the ADR now carries it in §8 as a statement about toolchains: ECJ at
+  `build.sh`'s flag set does not report it, so a locally green compile was evidence about the code and
+  never about CI's lint vocabulary. Same shape as ADR 0002 §11's `@SuppressWarnings` divergence, one
+  commit and one red run later.
 - `./build.sh` end to end: lint over 56 files including the two self-tested ADR rules, 27 main and
   14 test sources compiled, `PASS 5/5 substrate checks`, **`PASS 19/19 wal checks`**,
   `PASS 9/9 property checks` — the domain suite unchanged and still green, which matters because this
@@ -119,8 +134,9 @@ Eclipse JDT batch compiler, since no JDK distribution host is reachable from thi
   child acked nothing before it stopped", in consecutive cycles while another build was running in the
   same sandbox — a JVM that could not start, not a log that lost money. The harness now prints the
   child's exit code and captured output with that message and retries such a cycle once; the re-run is
-  **`PASS 1000/1000 kill -9 cycles`, 6,543 acks, 154 s, `killed=100` in every one of the ten
-  policy×model rows**. Retried-with-a-guard is recorded here because a green run after a guard is a
+  **`PASS 1000/1000 kill -9 cycles`, 6,543 acks, 154 s, 58 bytes per record, `killed=100` in every one
+  of the ten policy×model rows**, and CI's own run reproduced the same 284 unforced losses exactly while
+  the tear columns moved by a cycle or two — the workload is seeded, the instant of the kill is not. Retried-with-a-guard is recorded here because a green run after a guard is a
   different claim from a green run, and the difference should be visible.
 - Three bugs the suites caught while this was being written, each now a check rather than a fix:
   `WalRecovery.readAt` looped on top of `DurableChannel.readAt`, which already loops, so a read at EOF
