@@ -220,7 +220,7 @@ client's receipt and a client's money.**
 The lemma has one honest loophole, and it is a policy's, not the format's: under `NO_FSYNC` an ack
 means only "`write()` returned", so an acked-but-unforced record *can* sit past the watermark and be
 cut. That is not a bug and it is not fixed by recovery — it is what that policy promises (§5), and the
-harness measures it rather than hiding it: **285 acknowledged records lost across 100 power-loss
+harness measures it rather than hiding it: **284 acknowledged records lost across 100 power-loss
 cycles**, with `0` lost under either forcing policy in all 1,000 cycles.
 
 **The recovery marker is for the reader, not for correctness.** After a cut, recovery appends one
@@ -375,6 +375,15 @@ could not start, not a log that lost money — so the parent now reports the chi
 own captured output with that message and retries such a cycle exactly once, which is an environment
 guard and not a durability one: a second failure is reported as real. Re-running with the fix: 28
 retries printed, 0 failures.
+
+**A third finding came from CI, not from this sandbox, and says something about the toolchain.** javac's
+`-Xlint:all` reports a non-transient instance field of a non-serializable type inside a `Serializable`
+class as a warning, and `-Werror` makes that a failed build: `UnrecoverableLogException` carried an
+`Lsn` value for the reader's benefit and had to mark it `transient`, since the number it needs is
+already in the message and nothing in this repo serializes exceptions. The compiler this sandbox can
+install (ECJ, at the flag set `build.sh` uses) does not report it, so a locally green compile is
+evidence about the code and not about CI's vocabulary — the same split ADR 0002 §11 records for
+`@SuppressWarnings`, and the reason this ADR labels its local runs as ECJ runs.
 
 **Two bugs this harness and suite found, both worth the fix's description.** (1) The recovery scan
 *hung*: `WalRecovery.readAt` looped on top of `DurableChannel.readAt`, which already loops, so a read

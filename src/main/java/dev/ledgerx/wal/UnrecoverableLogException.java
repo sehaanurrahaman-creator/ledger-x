@@ -17,7 +17,15 @@ public final class UnrecoverableLogException extends IOException {
 
   private final Corruption cause;
   private final long offset;
-  private final Lsn lsn;
+
+  /**
+   * Transient by decision: {@link Lsn} is a value type of this layer, nothing here serializes
+   * exceptions, and the number rides in the message, which does survive. javac's {@code -Xlint:all}
+   * makes that a rule, since a non-transient field of a non-serializable type in a
+   * {@code Serializable} class is a warning and CI builds with {@code -Werror}; ECJ's lint set is
+   * narrower, so this is the kind of line only CI catches.
+   */
+  private final transient Lsn lsn;
 
   public UnrecoverableLogException(
       Corruption cause, long offset, Lsn lsn, String detail, Throwable reason) {
