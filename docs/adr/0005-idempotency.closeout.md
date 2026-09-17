@@ -15,9 +15,14 @@ claim, comment, close and map-append steps are carried here as paste-ready text.
 
 ## 0. Fastest route
 
-1. **The pull request** (created by this session, body =
-   [`0005-idempotency.resolution-comment.md`](./0005-idempotency.resolution-comment.md) verbatim)
-   runs CI on this branch; merge it once green.
+1. **The pull request exists and is green**: [#28](https://github.com/sehaanurrahaman-creator/ledger-x/pull/28),
+   body = [`0005-idempotency.resolution-comment.md`](./0005-idempotency.resolution-comment.md)
+   verbatim, CI `pass` on `ab33633` (run `35256255161`, 2m22s: lint with rules 6/7/8
+   self-tested, javac `--release 21 -Xlint:all -Werror` on main and test, the four contracts
+   5/5 · 20/20 · 13/13 · 15/15, both property suites 9/9 · 3/3, the demo, the 1,000-cycle
+   kill -9 harness, `PASS 71/71` boundary cycles and both extended campaigns). Merging it will
+   **not** close #7: this integration has no `issues: write`, the same finding as ADR 0004's
+   closeout.
 2. **A human then does three things**: paste §2 as a comment on #7; close #7 as completed;
    and make the two map edits — replace the map's *Decisions so far* with §4 and replace
    *Not yet specified* with §5, which strikes the *Public API surface* item this ticket
@@ -99,7 +104,8 @@ created by this session, attached to the map, and blocked by this ticket until i
 | Create the graduated fog ticket | [#27](https://github.com/sehaanurrahaman-creator/ledger-x/issues/27) — *What is ledger-x's public API surface? In-process library vs HTTP service, and the 409/410 mapping* |
 | Attach it to the map (`addSubIssue` → #1) | done — `parent_issue_url` on #27 points at #1 |
 | Wire `#27 blocked by #7` (`addBlockedBy`) | done — verified read-back |
-| Push this branch | done — `arena/01a0b02d-ledger-x` |
-| Open the pull request | done — body is the resolution comment verbatim |
+| Push this branch | done — `arena/01a0b02d-ledger-x`, head `ab33633` |
+| Open the pull request | done — [#28](https://github.com/sehaanurrahaman-creator/ledger-x/pull/28), body is the resolution comment verbatim |
+| CI on the pull request | done — `pass`, run `35256255161` |
 | Claim / comment on / close #7 | blocked — `issues: write` needed, §1–§3 |
 | Append the *Decisions so far* line | blocked — same, §4 |
