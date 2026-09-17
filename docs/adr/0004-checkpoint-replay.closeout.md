@@ -4,33 +4,37 @@ Ticket: [#6](https://github.com/sehaanurrahaman-creator/ledger-x/issues/6). Sess
 `arena/01a0afb5-ledger-x`, 2026-09-17. The ADR is [`0004-checkpoint-replay.md`](./0004-checkpoint-replay.md);
 the post-ready comment is [`0004-checkpoint-replay.resolution-comment.md`](./0004-checkpoint-replay.resolution-comment.md).
 
-This ticket's session found that **every** GitHub write is unavailable to the integration that runs it
-— not just self-assignment, which failed on #5 too. The evidence is in §6. So this file carries the
-actions a human (or a later session with `issues: write`) takes, with the text to paste.
+This ticket's session found the write wall precisely: **branch pushes and pull requests work; issues do
+not.** `git push origin arena/01a0afb5-ledger-x` succeeded, `gh pr create` opened [#24](https://github.com/sehaanurrahaman-creator/ledger-x/pull/24),
+and CI ran green on both the push and the pull request — but every issue write answers
+`Resource not accessible by integration` (`triage: false`, §6), and self-assignment is impossible because the
+assignable list holds only `sehaanurrahaman-creator`. So this file carries the three actions a human (or a
+later session with `issues: write`) takes, with the text to paste.
 
 ## 0. Fastest route
 
-1. **Merge the branch** (`arena/01a0afb5-ledger-x`) as a pull request whose body is
-   [`0004-checkpoint-replay.resolution-comment.md`](./0004-checkpoint-replay.resolution-comment.md)
-   verbatim. Merging does **not** close #6: this integration has no `issues: write`, and a
-   `Closes #6` in a body silently no-ops for an identity that cannot write issues — the same finding
-   as ADR 0003's closeout.
-2. **A human then does three things, plus one map edit**: paste §2 as a comment on #6, close #6 as
-   completed, replace the map's *Decisions so far* with §4 (which carries **five** lines — the four
-   before this ticket's were still unappended before it), and replace the map's *Not yet specified*
-   with §5, which strikes the replay state-hash item this ticket answered.
+1. **The pull request exists and is green**: [#24](https://github.com/sehaanurrahaman-creator/ledger-x/pull/24),
+   body = [`0004-checkpoint-replay.resolution-comment.md`](./0004-checkpoint-replay.resolution-comment.md)
+   verbatim, CI `success` on `a332454` (run `35234797105`; §6 has the read-back evidence). Merging it will
+   **not** close #6: this integration has no `issues: write`, and a `Closes #6` in a body silently no-ops
+   for an identity that cannot write issues — the same finding as ADR 0003's closeout.
+2. **A human then does four things**: merge #24; paste §2 as a comment on #6; close #6 as completed
+   (blocked here with `Resource not accessible by integration`, §6); and make the two map edits —
+   replace the map's *Decisions so far* with §4 (which carries **five** lines, the four before this
+   ticket's still unappended) and replace *Not yet specified* with §5, which strikes the replay
+   state-hash item this ticket answered.
 
 ## 1. Claim (blocked — `403 Resource not accessible by integration`)
 
 ```
 **Claimed.** Worked in session `arena/01a0afb5-ledger-x` (2026-09-17). Self-assignment is still not
-available to this integration — `gh issue edit 6 --add-assignee @me` answers `'arena-ai-coding-agent[bot]' not found`,
-and the repository's permissions for this identity are `{"admin":false,"maintain":false,"pull":false,"push":false,"triage":false}`,
-so issue comments and closes are 403 as well. Treat *How is state proven identical after a crash?* as
-off the frontier. Scope: the checkpoint format, the atomic swap, retention, the state-hash scheme, the
-determinism rules, and the crash-at-every-LSN-boundary harness. Rotation and WAL retention stay with
-*What does a durable write look like?*'s deferred item; idempotency, concurrency, the payout protocol,
-the TLA+ spec, the chaos campaign and the benchmarks stay with their own tickets.
+available to this integration: `repos/{owner}/{repo}/assignees` lists only `sehaanurrahaman-creator`,
+and `gh issue edit 6 --add-assignee @me` cannot resolve this identity — so this comment is the claim
+record: treat *How is state proven identical after a crash?* as off the frontier. Scope: the
+checkpoint format, the atomic swap, retention, the state-hash scheme, the determinism rules, and the
+crash-at-every-LSN-boundary harness. Rotation and WAL retention stay with *What does a durable write
+look like?*'s deferred item; idempotency, concurrency, the payout protocol, the TLA+ spec, the chaos
+campaign and the benchmarks stay with their own tickets.
 ```
 
 ```
@@ -91,13 +95,27 @@ only change is the removal of its first item, which §3 of the ADR answers.
 
 ## 6. What was verified, and by what
 
-**Claim, first, because it is this ticket's own finding:** the integration cannot write to this
-repository's issues at all. `gh api repos/sehaanurrahaman-creator/ledger-x --jq '.permissions'` answered
-`{"admin":false,"maintain":false,"pull":false,"push":false,"triage":false}`; `gh issue edit 6 --add-assignee @me`
-answered `'arena-ai-coding-agent[bot]' not found` and left the assignees empty. #6 is still
-**OPEN and unassigned** as this file was written. The failure is recorded rather than retried: ADR
-0003's closeout hit the same wall on #5 and its note — "this integration *can* merge a pull request, it
-just cannot close the ticket" — is the reason §0 routes through a pull request.
+**The write wall, measured rather than assumed — and it is only the issues that are walled.** What
+*works*: `git push origin arena/01a0afb5-ledger-x` (`* [new branch]`, exit 0) and
+`gh pr create` ([#24](https://github.com/sehaanurrahaman-creator/ledger-x/pull/24)), with CI running on both
+the push and the pull request. What is *blocked*: `gh issue comment 6 --body …` answered
+`Message: Resource not accessible by integration`, and `gh api repos/sehaanurrahaman-creator/ledger-x --jq '.permissions'`
+reports `{"admin":false,"maintain":false,"pull":false,"push":false,"triage":false}` — the App's installation
+lacks `issues: write`, which `scripts/ci-evidence.sh` also states as "all issue writes 403 for this integration
+when triage=false". Assignment specifically: `gh api repos/…/assignees` lists only `sehaanurrahaman-creator`,
+so a self-assignment claim can never resolve for this identity. #6 is therefore still **OPEN and
+unassigned** as this file was written: the claim, the resolution comment, the close and the two map
+edits are all carried here for a human. (ADR 0003's closeout reached the same split from the other
+side: "this integration *can* merge a pull request, it just cannot close the ticket".)
+
+**CI, read back rather than assumed** (`scripts/ci-evidence.sh arena/01a0afb5-ledger-x`): run
+`35234797105` on the pull request, `success` on `a332454` — one job, all steps — with these notice lines:
+`PASS 5/5 substrate checks` (measured `platformThreads=10`), `PASS 19/19 wal checks`,
+**`PASS 12/12 checkpoint checks`**, `PASS 9/9 property checks` at both the default campaign and the
+extended one (307 cases, 30,344 accepted), **`PASS 81/81 boundary cycles byte-identical`**, and
+`PASS 1000/1000 kill -9 cycles — zero invariant violations, zero acked-but-lost forced transactions;
+unforced acks lost across a power cut: 277 (which is what NO_FSYNC promises)`. The checkpoint step and
+the boundary step are new in `ci.yml` and both fit the budget: the job finished in under four minutes.
 
 **Locally, with the fallback toolchain** (`scripts/bootstrap-toolchain.sh`: Temurin 21.0.8 runtime +
 Eclipse JDT batch compiler, because no JDK distribution host is reachable from this sandbox):
@@ -123,9 +141,7 @@ Eclipse JDT batch compiler, because no JDK distribution host is reachable from t
   **134 vs 128 ms**, where the state is large and the log short and the checkpoint does not pay for
   itself in time. The checkpoint's case here is the proof and the bound, not raw speed.
 
-**Not verified here, and labelled as such in the ADR:** CI itself (no `issues: write` blocks nothing,
-but the run has to be watched by a human or a later session; `scripts/ci-evidence.sh` is how to read it
-back), any real power loss (the harness kills a process, so the page cache survives, and inside the
+**Not verified here, and labelled as such in the ADR:** any real power loss (the harness kills a process, so the page cache survives, and inside the
 swap the kill is a stage boundary rather than a byte-level interleaving), a lying controller or
 out-of-order device, multi-process checkpoint writing, and rotation — which remains unstarted, with
 ADR 0004 §11 recording the order it must follow and the `COVERAGE_GONE` check as the guard.
