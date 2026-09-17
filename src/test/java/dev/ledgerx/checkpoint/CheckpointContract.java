@@ -386,6 +386,11 @@ public final class CheckpointContract {
         if (records.size() != scan.report().lastLsn()) {
           throw new AssertionError("the history has a marker in it; this check wants a clean log");
         }
+        if (open.ledger().journalEvents() != records.size()) {
+          throw new AssertionError(
+              "the ledger holds " + open.ledger().journalEvents() + " events and the log holds "
+                  + records.size());
+        }
       }
       // The whole log, kept: a truncation cannot grow a file back, so every boundary has to start
       // from the intact log rather than from the previous, shorter cut.
@@ -468,6 +473,11 @@ public final class CheckpointContract {
     try (DurableLedger open = build(ledger, FsyncPolicy.PER_COMMIT, shortOps)) {
       // Nothing on disk yet, and an open this small must not write one: a checkpoint that saves
       // fewer records than it costs in fsyncs is a write, not an optimisation.
+      if (open.ledger().journalEvents() != 4 + shortOps) {
+        throw new AssertionError(
+            "the fixture built " + open.ledger().journalEvents() + " events, wanted "
+                + (4 + shortOps));
+      }
     }
     try (DurableLedger reopened = DurableLedger.open(ledger, FsyncPolicy.PER_COMMIT)) {
       if (reopened.checkpointDecision().outcome() != CheckpointRecovery.Outcome.ABSENT) {
@@ -737,8 +747,9 @@ public final class CheckpointContract {
     byte[] damaged = original.clone();
     damaged[4] = (byte) (damaged[4] ^ 0x01);
     Files.write(wal, damaged);
-    try (DurableLedger open = DurableLedger.open(ledger, FsyncPolicy.PER_COMMIT)) {
-      throw new AssertionError("a damaged segment header opened, checkpoint or not");
+    try (DurableLedger shouldNotOpen = DurableLedger.open(ledger, FsyncPolicy.PER_COMMIT)) {
+      throw new AssertionError(
+          "a damaged segment header opened, checkpoint or not: " + shouldNotOpen);
     } catch (UnrecoverableLogException refused) {
       if (refused.corruption() != Corruption.BAD_SEGMENT_HEADER) {
         throw new AssertionError("refused for the wrong reason: " + refused.corruption());

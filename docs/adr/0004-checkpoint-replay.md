@@ -376,7 +376,7 @@ The rest of the 13:
   a snapshot and write no file; after a reopen, whose prefix `open()` forces, a checkpoint at LSN 16
   is sound, is written, and is used.
 
-**Three findings, in the order they cost time.**
+**Four findings, in the order they cost time.**
 
 *(1) The soundness guard is not decoration, and this was measured rather than argued.* With the
 `appliedLsn != forcedLsn` check disabled, a `NO_FSYNC` ledger holding 16 unforced records happily
@@ -402,6 +402,19 @@ after the k=0 cut the log was 16 bytes and every later "cut" was a no-op. The sy
 and is the reason the check is shaped this way — all three recovery paths agreed with each other
 while disagreeing with the in-memory fold, so a harness that only compared recoveries would have
 passed. The fix restores the intact log before each cut and asserts the cut took.
+
+*(4) A fourth came from CI and not from this sandbox, and it is the same toolchain split ADR 0002 §11
+and ADR 0003 §6 both recorded.* javac's `-Xlint:all` includes `-Xlint:try`, which reports
+"auto-closeable resource `open` is never referenced in body of corresponding try statement", and
+`-Werror` makes that a failed build. Three places in `CheckpointContract` opened a `DurableLedger`
+purely for its side effect on disk — build a history, then close it — and never named the handle.
+ECJ, at the flag set `scripts/bootstrap-toolchain.sh` uses, does not report it, so the local build was
+green and CI's javac run was red on the first push. The fix was to reference the handles, which each
+of those three sites should have been doing anyway: two now assert that the fixture built the event
+count it claims, and the third names the ledger it is asserting should never have opened. Recorded
+because it is the third time this repository has learned that **a locally green compile is evidence
+about the code and not about CI's vocabulary**, and because the lesson keeps being the same one: the
+sandbox's compiler is a fallback, and CI's javac is the check of record.
 
 **What this does not prove.** No crash *during* the atomic swap on real hardware: the harness
 simulates the outcomes (an orphan scratch file, a truncated checkpoint, a stale one) rather than
