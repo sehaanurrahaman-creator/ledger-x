@@ -32,6 +32,12 @@ jobs:
       - name: Build and test
         run: ./build.sh
 
+      # ADR 0004's evidence: sweep every byte offset of twelve random histories as a crash
+      # point — crash, recover, hash — and demand checkpoint + tail, full replay from scratch,
+      # and crash-recover-continue all land on the clean run's exact bytes.
+      - name: Checkpoint replay harness
+        run: make replay
+
       # The domain ticket's deliverable, run as a human would run it. The demo asserts what it
       # prints — Σ balances = 0, the index equal to a fold of the log, a refused transaction
       # that changed nothing — and exits non-zero if any of it is untrue.

@@ -264,6 +264,59 @@ public final class Wal implements AutoCloseable {
     return durableThrough;
   }
 
+  /**
+   * Forces everything written so far and returns the byte offset the force made durable.
+   *
+   * <p>This is ADR 0001's checkpoint fsync, and it routes through the committer rather than
+   * calling {@code force} directly on the channel: a force issued beside an in-flight group
+   * could return before that group's {@code write()} has landed, and a watermark built on it
+   * would claim durability for bytes that have no claim to it. So the request joins the queue
+   * as a barrier — the committer processes it between groups, forces the channel, and only
+   * then publishes {@code durableThrough = writtenThrough} and completes the caller. The
+   * returned offset is the committer's own number, and everything at or below it is durable.
+   *
+   * <p>The checkpoint path calls this before it serializes state, per ADR 0003 §10's ordering
+   * rule: the bytes a watermark names are durable before the snapshot claiming them exists —
+   * never the reverse. Under the ledger's commit lock the queue is empty when this runs,
+   * which is what makes the watermark and the serialized state the same moment.
+   *
+   * @throws IllegalStateException if the WAL is closed, has failed, or has a full append
+   *     queue (a checkpoint of a log with 4,096 unacked appends is refused — backpressure is
+   *     ticket #8's, and this refuses rather than forcing less than it returns)
+   */
+  public long force() throws IOException {
+    IOException dead = failure;
+    if (dead != null) {
+      throw new IllegalStateException("this WAL has failed: " + dead.getMessage(), dead);
+    }
+    if (closed) {
+      throw new IllegalStateException("this WAL is closed");
+    }
+    Pending barrier = new Pending(null, null, null, null, new CompletableFuture<>());
+    if (!queue.offer(barrier)) {
+      throw new IllegalStateException(
+          "the WAL's append queue is full ("
+              + QUEUE_CAPACITY
+              + " appends unacknowledged), so a checkpoint force cannot join it; queue depth and"
+              + " backpressure are ticket #8's");
+    }
+    try {
+      // Bounded, so a close that races this call turns into a loud failure rather than a
+      // quiet hang: once the committer is gone the barrier would never be processed.
+      return barrier.forced.get(30, TimeUnit.SECONDS);
+    } catch (InterruptedException interrupted) {
+      Thread.currentThread().interrupt();
+      throw new IOException("interrupted while waiting for the WAL's force", interrupted);
+    } catch (ExecutionException failed) {
+      Throwable cause = failed.getCause();
+      throw cause instanceof IOException io
+          ? io
+          : new IOException("the WAL's force failed", cause);
+    } catch (java.util.concurrent.TimeoutException nobodyWillForce) {
+      throw new IOException("the WAL's committer did not process the force within 30s");
+    }
+  }
+
   /** Bytes {@code write()} has been asked to put in the file, forced or not. */
   public long writtenThrough() {
     return writtenThrough;
@@ -360,6 +413,13 @@ public final class Wal implements AutoCloseable {
         if (head == stopSignal) {
           return;
         }
+        if (head.forced != null) {
+          // A force barrier travels alone: it is not a record, it joins no group, and its
+          // whole job is to be processed between groups so the watermark it publishes is
+          // the committer's own.
+          forceNow(head.forced);
+          continue;
+        }
         group.add(head);
         if (fillGroup(head, group)) {
           flush(group);
@@ -374,6 +434,18 @@ public final class Wal implements AutoCloseable {
       fail(failed);
     } finally {
       abandonLeftovers();
+    }
+  }
+
+  /** The only place {@code durableThrough} advances past a force: on the committer. */
+  private void forceNow(CompletableFuture<Long> done) {
+    try {
+      channel.forceAll();
+      durableThrough = writtenThrough;
+      done.complete(durableThrough);
+    } catch (IOException failed) {
+      fail(failed);
+      done.completeExceptionally(failed);
     }
   }
 
@@ -406,6 +478,13 @@ public final class Wal implements AutoCloseable {
       }
       if (next == stopSignal) {
         return true;
+      }
+      if (next.forced != null) {
+        // A barrier met mid-collection forces what the group has written so far — nothing,
+        // since this group has not been written yet — which is exactly the promise: the
+        // watermark it returns covers every completed write and no in-flight one.
+        forceNow(next.forced);
+        continue;
       }
       group.add(next);
     }
@@ -484,12 +563,18 @@ public final class Wal implements AutoCloseable {
     }
   }
 
-  /** One append in flight. The committer-filled fields are confined to that thread. */
+  /**
+   * One append in flight — or a force barrier, whose type is null. The committer-filled
+   * fields are confined to that thread.
+   */
   private static final class Pending {
     final RecordType type;
     final byte[] payload;
     final FsyncPolicy policy;
     final CompletableFuture<Ack> future;
+
+    /** Non-null only on a force barrier: the future the caller waits on for the watermark. */
+    final CompletableFuture<Long> forced;
     Lsn lsn;
     byte[] frame;
     long offset;
@@ -499,10 +584,20 @@ public final class Wal implements AutoCloseable {
         byte[] payload,
         FsyncPolicy policy,
         CompletableFuture<Ack> future) {
+      this(type, payload, policy, future, null);
+    }
+
+    Pending(
+        RecordType type,
+        byte[] payload,
+        FsyncPolicy policy,
+        CompletableFuture<Ack> future,
+        CompletableFuture<Long> forced) {
       this.type = type;
       this.payload = payload;
       this.policy = policy;
       this.future = future;
+      this.forced = forced;
     }
   }
 }

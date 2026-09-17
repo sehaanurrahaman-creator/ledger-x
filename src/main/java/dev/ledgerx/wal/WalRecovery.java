@@ -60,6 +60,7 @@ public final class WalRecovery {
       Tail tail,
       String detail) {
 
+
     /** Whether this scan cut anything. */
     public boolean torn() {
       return truncatedBytes > 0L;
@@ -86,8 +87,21 @@ public final class WalRecovery {
     }
   }
 
-  /** A report and the records it validated, in log order. Markers are in the list, and skipped. */
-  public record Scan(Report report, List<WalRecord> records) {
+  /**
+   * A report and the records it validated, in log order. Markers are in the list, and skipped.
+   *
+   * @param frameEnds the byte offset one past each record's last byte, parallel to
+   *     {@code records} — frame {@code i} ends at {@code frameEnds[i]}. Built for the
+   *     checkpoint's coverage check, which must confirm that the frame an LSN names ends at
+   *     exactly the offset the checkpoint claims; internally built, and not to be mutated.
+   */
+  public record Scan(Report report, List<WalRecord> records, long[] frameEnds) {
+
+    /** The offset one past frame {@code index}'s last byte; frame 1 ends at index 0. */
+    public long endOffsetOfFrame(int index) {
+      return frameEnds[index];
+    }
+
 
     /** Only the frames a fold must apply. */
     public List<WalRecord> journalRecords() {
@@ -122,9 +136,10 @@ public final class WalRecovery {
     if (size == 0L) {
       return new Scan(
           new Report(0L, 0L, 0L, 0, 0, 0, 0L, Tail.EMPTY_FILE, "the file holds no bytes"),
-          List.of());
+          List.of(), new long[0]);
     }
     List<WalRecord> records = new ArrayList<>();
+    List<Long> frameEnds = new ArrayList<>();
     long position = WalFormat.SEGMENT_HEADER_BYTES;
     long nextLsn = Lsn.FIRST;
     Tail tail = Tail.CLEAN_EOF;
@@ -209,6 +224,7 @@ public final class WalRecovery {
         }
         nextLsn = record.lsn().value() + 1L;
         position += declared;
+        frameEnds.add(position);
       }
     }
     long lastLsn = nextLsn - 1L;
@@ -222,7 +238,11 @@ public final class WalRecovery {
         new Report(
             size, position, size - position, records.size(), records.size() - markers, markers,
             lastLsn, tail, detail);
-    return new Scan(report, List.copyOf(records));
+    long[] ends = new long[frameEnds.size()];
+    for (int i = 0; i < ends.length; i++) {
+      ends[i] = frameEnds.get(i);
+    }
+    return new Scan(report, List.copyOf(records), ends);
   }
 
   /** Cuts the file at {@code bytes} and makes the cut durable. The only destructive call here. */

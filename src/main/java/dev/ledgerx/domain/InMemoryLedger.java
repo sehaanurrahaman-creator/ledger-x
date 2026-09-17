@@ -34,7 +34,14 @@ import java.util.Objects;
  */
 public final class InMemoryLedger {
 
-  /** The append-only log. Position is the sequence number; nothing is ever removed. */
+  /**
+   * The append-only log. Position is the sequence number; nothing is ever removed.
+   *
+   * <p>On a ledger restored from materialized state ({@link #restored}) this list holds the
+   * events <em>after</em> the restore point: the earlier events are already folded into the
+   * balances this ledger was built with, which is what a checkpoint is. The full history
+   * stays in the durable log; only this in-memory view of it starts late.
+   */
   private final List<JournalEvent> events = new ArrayList<>();
 
   /** Index: accounts by id, in opening order. Derived from the log, checked against it. */
@@ -42,6 +49,32 @@ public final class InMemoryLedger {
 
   /** Index: balance in signed minor units, debit-positive. Derived from the log. */
   private final Map<AccountId, Long> balances = new LinkedHashMap<>();
+
+  /** Balances as they stood at a restore, the accounts as they stood there, and the journal
+   * length the restore included. Empty for a ledger that has never been restored, which
+   * makes every restore-aware rule below collapse to the from-scratch case. */
+  private final Map<AccountId, Long> restoredBalances;
+
+  private final List<Account> restoredAccounts;
+
+  private final long baseEvents;
+
+  /** A fresh, empty ledger — the only constructor most callers ever need. */
+  public InMemoryLedger() {
+    this(Map.of(), List.of(), 0L);
+  }
+
+  /** The restore path: the whole restore state fixed at construction, final like the rest. */
+  private InMemoryLedger(
+      Map<AccountId, Long> restoredBalances, Iterable<Account> restoredAccounts, long baseEvents) {
+    List<Account> table = new ArrayList<>();
+    for (Account account : restoredAccounts) {
+      table.add(account);
+    }
+    this.restoredBalances = Map.copyOf(restoredBalances);
+    this.restoredAccounts = List.copyOf(table);
+    this.baseEvents = baseEvents;
+  }
 
   /**
    * Opens an account. Appends an event and moves no money, so it cannot disturb Σ balances.
@@ -58,6 +91,68 @@ public final class InMemoryLedger {
     balances.put(id, 0L);
     events.add(new JournalEvent.AccountOpened(account));
     return account;
+  }
+
+  /**
+   * Builds a ledger from materialized state — the account table and the balances a
+   * checkpoint carries, with {@code eventCount} pinning how much journal the state already
+   * includes. This is the domain's whole restore surface, and ADR 0004 §5 is the argument
+   * for why it lives here rather than in the checkpoint layer: a restored ledger is a real
+   * ledger, subject to the same audit and the same posting rules, so the restore has to be
+   * something the domain can vouch for rather than fields set from outside.
+   *
+   * <p>What the restored ledger promises, and how it differs from a fresh one only where it
+   * must: {@link #balances} and {@link #accounts} hold the restored state; {@link #events}
+   * and {@link #transactions} hold only what is appended <em>after</em> the restore;
+   * {@link #size} counts the restored journal length plus the appends, so the ledger's
+   * position in the event stream is continuous across the restore; {@link #audit} folds
+   * post-restore events on top of the restored balances rather than from zero, so the
+   * index-versus-log check means exactly what it always meant; and posting validates
+   * against the restored balances, which are ordinary balances for every purpose.
+   *
+   * @param accounts the restored account table, in canonical (opening) order
+   * @param balances one balance per account, debit-positive minor units
+   * @param eventCount the journal length the materialized state includes
+   * @throws IllegalArgumentException if the accounts and balances do not describe one
+   *     consistent table, or if Σ balances is not exactly zero — which every legal ledger's
+   *     is, so a set of balances that sums elsewhere was never one
+   */
+  public static InMemoryLedger restored(
+      List<Account> accounts, Map<AccountId, Long> balances, long eventCount) {
+    Objects.requireNonNull(accounts, "restored accounts");
+    Objects.requireNonNull(balances, "restored balances");
+    if (eventCount < 0L) {
+      throw new IllegalArgumentException("a restored journal length counts from 0: " + eventCount);
+    }
+    LinkedHashMap<AccountId, Account> accountTable = new LinkedHashMap<>();
+    LinkedHashMap<AccountId, Long> balanceTable = new LinkedHashMap<>();
+    for (Account account : accounts) {
+      Long balance = balances.get(account.id());
+      if (balance == null) {
+        throw new IllegalArgumentException("no restored balance for " + account.id());
+      }
+      if (accountTable.putIfAbsent(account.id(), account) != null) {
+        throw new IllegalArgumentException("the restored state opens " + account.id() + " twice");
+      }
+      balanceTable.put(account.id(), balance);
+    }
+    if (balanceTable.size() != balances.size()) {
+      throw new IllegalArgumentException(
+          "the restored balances name " + (balances.size() - balanceTable.size())
+              + " account(s) the account table does not");
+    }
+    BigInteger sum = BigInteger.ZERO;
+    for (long balance : balanceTable.values()) {
+      sum = sum.add(BigInteger.valueOf(balance));
+    }
+    if (!sum.equals(BigInteger.ZERO)) {
+      throw new IllegalArgumentException(
+          "the restored balances sum to " + sum + " minor units; a legal ledger's sum to 0");
+    }
+    InMemoryLedger ledger = new InMemoryLedger(balanceTable, accountTable.values(), eventCount);
+    ledger.accounts.putAll(accountTable);
+    ledger.balances.putAll(balanceTable);
+    return ledger;
   }
 
   public boolean isKnown(AccountId id) {
@@ -265,6 +360,12 @@ public final class InMemoryLedger {
    */
   public Map<AccountId, Money> foldBalances() {
     Map<AccountId, BigInteger> folded = new LinkedHashMap<>();
+    // A restored ledger's fold starts from the balances the restore carried, so the fold and
+    // the index answer the same question: what does the materialized state plus every event
+    // since say, rather than what do the tail events alone say.
+    for (Map.Entry<AccountId, Long> restored : restoredBalances.entrySet()) {
+      folded.put(restored.getKey(), BigInteger.valueOf(restored.getValue()));
+    }
     for (JournalEvent event : events) {
       if (event instanceof JournalEvent.AccountOpened opened) {
         folded.putIfAbsent(opened.account().id(), BigInteger.ZERO);
@@ -306,9 +407,13 @@ public final class InMemoryLedger {
     return List.copyOf(accounts.values());
   }
 
-  /** The number of events appended, which is also the next sequence number. */
-  public int size() {
-    return events.size();
+  /**
+   * The journal length: events included by a restore, plus events appended since. For a
+   * ledger that was never restored this is the number of events appended, which is also the
+   * next sequence number.
+   */
+  public long size() {
+    return baseEvents + events.size();
   }
 
   /**
@@ -325,6 +430,12 @@ public final class InMemoryLedger {
    */
   public void audit() {
     Map<AccountId, Account> openedByLog = new LinkedHashMap<>();
+    // A restored ledger's account table came from the checkpoint, not from the events this
+    // instance holds, so the restored accounts count as "opened by the log" — the log is
+    // the durable history, and the restore is a view onto part of it.
+    for (Account restored : restoredAccounts) {
+      openedByLog.putIfAbsent(restored.id(), restored);
+    }
     int sequence = 0;
     for (JournalEvent event : events) {
       if (event instanceof JournalEvent.AccountOpened open) {

@@ -5,6 +5,7 @@
 #   ./build.sh            lint, compile, the substrate contract, the WAL contract, the properties
 #   ./build.sh compile    lint and compile, run nothing
 #   ./build.sh crash      the kill -9 micro-harness: 1,000 random kill/recover cycles per policy
+#   ./build.sh replay     the checkpoint replay harness: crash at every byte offset of every history
 #   ./build.sh test       compile and run both test mains
 #   ./build.sh demo       compile and run the transfer demo — what `make demo` runs
 #   ./build.sh campaign   the property suite at a much larger campaign than CI runs
@@ -30,6 +31,8 @@ readonly MAIN_OUT="${BUILD_DIR}/classes/main"
 readonly TEST_OUT="${BUILD_DIR}/classes/test"
 readonly CONTRACT_ENTRY="dev.ledgerx.substrate.SubstrateContract"
 readonly WAL_CONTRACT_ENTRY="dev.ledgerx.wal.WalContract"
+readonly CHECKPOINT_ENTRY="dev.ledgerx.checkpoint.CheckpointContract"
+readonly REPLAY_ENTRY="dev.ledgerx.checkpoint.ReplayHarness"
 readonly CRASH_ENTRY="dev.ledgerx.wal.crash.CrashHarness"
 readonly PROPERTIES_ENTRY="dev.ledgerx.domain.DomainModelProperties"
 readonly DEMO_ENTRY="dev.ledgerx.demo.TransferDemo"
@@ -49,6 +52,14 @@ readonly CAMPAIGN_OPERATIONS=400
 #   LEDGER_X_CRASH_CYCLES=5000 LEDGER_X_CRASH_OPS=200 ./build.sh crash
 readonly CRASH_CYCLES="${LEDGER_X_CRASH_CYCLES:-1000}"
 readonly CRASH_OPS="${LEDGER_X_CRASH_OPS:-24}"
+
+# The checkpoint replay harness: every byte offset of every history is a crash. Sized so the
+# default sweeps tens of thousands of crash offsets in well under a minute; the campaign knob
+# multiplies it, e.g.
+#   LEDGER_X_REPLAY_TRIALS=60 LEDGER_X_REPLAY_OPS=80 ./build.sh replay
+readonly REPLAY_TRIALS="${LEDGER_X_REPLAY_TRIALS:-12}"
+readonly REPLAY_OPS="${LEDGER_X_REPLAY_OPS:-40}"
+readonly REPLAY_SEED="${LEDGER_X_REPLAY_SEED:-20260917}"
 
 log() { printf '\n==> %s\n' "$*"; }
 
@@ -196,6 +207,12 @@ do_wal_contract() {
   annotate "${log_file}"
 }
 
+do_checkpoint_contract() {
+  local log_file="${BUILD_DIR}/checkpoint-contract.log"
+  run_main "checkpoint contract" "${CHECKPOINT_ENTRY}" "${log_file}"
+  annotate "${log_file}"
+}
+
 do_properties() {
   local log_file="${BUILD_DIR}/property-test.log"
   campaign_opts
@@ -212,9 +229,36 @@ do_demo() {
   run_main "demo" "${DEMO_ENTRY}" "${log_file}"
 }
 
+do_replay() {
+  local log_file="${BUILD_DIR}/replay-harness.log"
+  log "checkpoint replay harness: ${REPLAY_TRIALS} histories x ${REPLAY_OPS} steps, every"
+  log "byte offset a crash"
+  local status=0
+  if ! java "${JAVA_OPTS[@]}" \
+    -Dledgerx.replay.trials="${REPLAY_TRIALS}" \
+    -Dledgerx.replay.ops="${REPLAY_OPS}" \
+    -Dledgerx.replay.seed="${REPLAY_SEED}" \
+    -cp "${MAIN_OUT}:${TEST_OUT}" "${REPLAY_ENTRY}" | tee "${log_file}"; then
+    status=1
+  fi
+  if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+    {
+      printf '### checkpoint replay harness\n\n```\n'
+      grep -E "^  trial |^PASS|^FAIL" "${log_file}" || tail -n 20 "${log_file}"
+      printf '\n```\n'
+    } >> "${GITHUB_STEP_SUMMARY}"
+  fi
+  if [ "${status}" -ne 0 ]; then
+    annotate_failure "replay harness" "${log_file}" tail
+    exit 1
+  fi
+  annotate "${log_file}"
+}
+
 do_test() {
   do_contract_test
   do_wal_contract
+  do_checkpoint_contract
   do_properties
 }
 
@@ -261,6 +305,7 @@ case "${1:-all}" in
   all)      require_java; do_build ;;
   compile)  require_java; do_compile ;;
   test)     require_java; do_compile; do_test ;;
+  replay)   require_java; do_compile; do_replay ;;
   crash)    require_java; do_compile; do_crash ;;
   demo)     require_java; do_compile; do_demo ;;
   campaign) require_java; do_compile; do_campaign ;;
