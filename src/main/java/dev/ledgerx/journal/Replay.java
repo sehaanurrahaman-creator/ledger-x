@@ -1,5 +1,7 @@
 package dev.ledgerx.journal;
 
+import dev.ledgerx.checkpoint.Checkpoint;
+import dev.ledgerx.checkpoint.StateHash;
 import dev.ledgerx.domain.InMemoryLedger;
 import dev.ledgerx.domain.JournalEvent;
 import dev.ledgerx.domain.RejectedTransactionException;
@@ -42,6 +44,33 @@ public final class Replay {
   /** Folds a scan's ledger events, markers skipped, into a fresh ledger. */
   public static InMemoryLedger fold(WalRecovery.Scan scan) throws IOException {
     return foldEvents(scan.journalRecords());
+  }
+
+  /**
+   * Recovery with a checkpoint: the checkpoint's state is the fold's base, and the tail —
+   * every record after the watermark — folds on top of it.
+   *
+   * <p>That the tail starts at record {@code watermarkLsn + 1} is not a convention but an
+   * LSN fact: LSNs are dense from 1 within a surviving prefix (ADR 0003 §2), so record
+   * {@code n} sits at index {@code n - 1}, and the checkpoint's coverage check has already
+   * confirmed that this record's frame ends exactly at the checkpoint's claimed byte
+   * offset. A fold over checkpoint-plus-tail is therefore the same fold as from scratch,
+   * minus the events the checkpoint has already materialized — which is the claim the
+   * replay harness proves by running both over every prefix of a history and comparing
+   * bytes. What this method adds to the fold is only the audit, unchanged.
+   */
+  public static InMemoryLedger fold(WalRecovery.Scan scan, Checkpoint.Loaded checkpoint)
+      throws IOException {
+    if (checkpoint == null) {
+      return foldEvents(scan.journalRecords());
+    }
+    InMemoryLedger ledger = StateHash.decodeLedger(checkpoint.state());
+    List<WalRecord> records = scan.records();
+    for (int i = (int) checkpoint.watermarkLsn(); i < records.size(); i++) {
+      apply(ledger, records.get(i));
+    }
+    ledger.audit();
+    return ledger;
   }
 
   /** Folds records in log order. The list is the log; nothing here re-sorts or de-duplicates. */

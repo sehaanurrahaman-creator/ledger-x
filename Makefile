@@ -2,6 +2,7 @@
 #
 #   make            lint, compile, run all three suites: substrate, WAL contract, properties
 #   make crash        the kill -9 micro-harness: 1,000 random kill/recover cycles
+#   make replay     the checkpoint replay harness: every byte offset of every history is a crash
 #   make demo       post a two-account transfer and print the balances and the ledger
 #   make campaign   the property suite at ~10x the campaign CI runs
 #   make test       compile and run both test mains, nothing else
@@ -34,6 +35,9 @@ all:
 compile:
 	./build.sh compile
 
+replay:
+	LEDGER_X_REPLAY_TRIALS="$(or $(TRIALS),)" LEDGER_X_REPLAY_OPS="$(or $(OPS),)" ./build.sh replay
+
 test:
 	$(CAMPAIGN_ENV) ./build.sh test
 
@@ -54,4 +58,4 @@ lint:
 clean:
 	./build.sh clean
 
-.PHONY: all compile test demo crash campaign lint clean
+.PHONY: all compile test demo crash replay campaign lint clean

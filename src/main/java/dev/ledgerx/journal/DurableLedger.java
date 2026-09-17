@@ -1,5 +1,7 @@
 package dev.ledgerx.journal;
 
+import dev.ledgerx.checkpoint.Checkpoint;
+import dev.ledgerx.checkpoint.StateHash;
 import dev.ledgerx.domain.Account;
 import dev.ledgerx.domain.AccountId;
 import dev.ledgerx.domain.AccountKind;
@@ -12,6 +14,7 @@ import dev.ledgerx.wal.RecordType;
 import dev.ledgerx.wal.Wal;
 import dev.ledgerx.wal.WalRecovery;
 import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Objects;
 import java.util.concurrent.locks.ReentrantLock;
@@ -45,15 +48,24 @@ public final class DurableLedger implements AutoCloseable {
   private final Wal wal;
   private final InMemoryLedger ledger;
   private final WalRecovery.Report recovery;
+  private final Checkpoint.Loaded checkpointAtOpen;
+  private final Path directory;
   private final ReentrantLock commitLock = new ReentrantLock();
 
   private volatile IOException failure;
   private Wal.Ack lastAck;
 
-  private DurableLedger(Wal wal, InMemoryLedger ledger, WalRecovery.Report recovery) {
+  private DurableLedger(
+      Wal wal,
+      InMemoryLedger ledger,
+      WalRecovery.Report recovery,
+      Checkpoint.Loaded checkpointAtOpen,
+      Path directory) {
     this.wal = wal;
     this.ledger = ledger;
     this.recovery = recovery;
+    this.checkpointAtOpen = checkpointAtOpen;
+    this.directory = directory;
   }
 
   /**
@@ -67,18 +79,47 @@ public final class DurableLedger implements AutoCloseable {
   /**
    * The same, with recovery's repair switch exposed: {@code false} opens a torn log for inspection
    * only, which is what the harness uses to check a crash without editing the evidence.
+   *
+   * <p>Recovery is checkpoint plus tail: the directory's checkpoint — validated against the
+   * scan first, discarded if its own bytes are damaged, refused if it names coverage the log
+   * cannot prove — is the fold's base, and every record after its watermark folds on top.
+   * With no checkpoint this is exactly the from-scratch fold it always was.
    */
   public static DurableLedger open(Path directory, FsyncPolicy policy, boolean repair)
       throws IOException {
-    Wal wal = Wal.open(directory.resolve(Wal.FILE_NAME), policy, repair);
+    // The temp half of a checkpoint swap is garbage however its writer died: deleted before
+    // anything is read, so no recovery path can ever meet one.
+    Checkpoint.cleanTemp(directory);
+    Path file = directory.resolve(Wal.FILE_NAME);
+    if (!Files.exists(directory.resolve(Checkpoint.FILE_NAME))) {
+      // The common path, and the old one: no checkpoint, so the log is the whole story and
+      // one scan inside Wal.open is all the reading there is.
+      Wal wal = Wal.open(file, policy, repair);
+      InMemoryLedger replayed;
+      try {
+        replayed = Replay.fold(wal.recovered(), null);
+      } catch (IOException | RuntimeException cannotReplay) {
+        wal.close();
+        throw cannotReplay;
+      }
+      return new DurableLedger(wal, replayed, wal.recovery(), null, directory);
+    }
+    // With a checkpoint, the cross-check runs BEFORE the repairing open: a checkpoint whose
+    // coverage the log cannot prove is a data-loss finding, and the evidence — the log
+    // exactly as it lies — must be intact when the refusal says so. Wal.open would have cut
+    // a torn tail and appended a marker before the fold ever ran, which is the right repair
+    // on the way into a ledger and the wrong one on the way out of a refusal.
+    WalRecovery.Scan scanned = WalRecovery.scan(file);
+    Checkpoint.Loaded checkpoint = Checkpoint.load(directory, scanned);
+    Wal wal = Wal.open(file, policy, repair);
     InMemoryLedger replayed;
     try {
-      replayed = Replay.fold(wal.recovered());
+      replayed = Replay.fold(wal.recovered(), checkpoint);
     } catch (IOException | RuntimeException cannotReplay) {
       wal.close();
       throw cannotReplay;
     }
-    return new DurableLedger(wal, replayed, wal.recovery());
+    return new DurableLedger(wal, replayed, wal.recovery(), checkpoint, directory);
   }
 
   /**
@@ -145,6 +186,48 @@ public final class DurableLedger implements AutoCloseable {
   /** The ledger behind the log: live balances, the event list, the auditor. */
   public InMemoryLedger ledger() {
     return ledger;
+  }
+
+  /**
+   * Writes a checkpoint of the current state: force the log through its last written byte
+   * (ADR 0001 puts {@code force(true)} at checkpoint; ADR 0003 §10 states the ordering as a
+   * rule — the bytes the watermark names are durable before the snapshot claiming them
+   * exists), serialize the state, and swap the file into place atomically.
+   *
+   * <p>The whole thing runs under the commit lock, which is what makes the watermark and
+   * the serialized state the same moment: no commit can append (and no apply can land)
+   * between the force and the encode, so the state on disk is exactly the state the log
+   * proves through {@code watermarkLsn} / {@code watermarkOffset}.
+   *
+   * @return the checkpoint as written, watermark and hash included
+   */
+  public Checkpoint.Loaded writeCheckpoint() throws IOException {
+    commitLock.lock();
+    try {
+      requireHealthy();
+      long watermarkOffset = wal.force();
+      long watermarkLsn = wal.nextLsn().value() - 1L;
+      if (watermarkOffset > wal.durableThrough()) {
+        throw new IOException(
+            "the checkpoint's watermark (byte " + watermarkOffset
+                + ") is past the offset the log's force covers (" + wal.durableThrough()
+                + ") — refusing to claim durability the log did not promise");
+      }
+      byte[] state = StateHash.encode(ledger);
+      return Checkpoint.write(directory, watermarkLsn, watermarkOffset, state);
+    } finally {
+      commitLock.unlock();
+    }
+  }
+
+  /**
+   * The checkpoint this open loaded and used, or {@code null} when there was none — which
+   * includes the case of one that failed its own integrity checks and was discarded, since
+   * the discard falls back to from-scratch replay. A caller that must distinguish those
+   * looks for {@code checkpoint.rejected} beside the log.
+   */
+  public Checkpoint.Loaded checkpointAtOpen() {
+    return checkpointAtOpen;
   }
 
   public Wal wal() {

@@ -33,6 +33,22 @@ public enum Corruption {
    */
   DOMAIN_REJECTED,
 
+  /**
+   * A checkpoint file is intact and hash-verified, but names coverage the log cannot prove:
+   * an offset past the log's surviving bytes, or an LSN whose frame does not end exactly
+   * where the checkpoint says. A torn write cannot produce this — the covered bytes were
+   * forced before the checkpoint existed (ADR 0001's table puts {@code force(true)} at
+   * checkpoint, and ADR 0003 §10 states the ordering as a rule) — so the honest readings
+   * are a log that lost acknowledged data or a checkpoint from another history, and the
+   * first of those is exactly what replaying from scratch would paper over. Recovery
+   * refuses; an operator who wants from-scratch replay deletes the checkpoint, visibly,
+   * which makes the loss a decision instead of a surprise. (A checkpoint that fails its
+   * <em>own</em> integrity checks is the other case and the opposite verdict: it is
+   * discarded and replay proceeds from scratch, because a damaged optimization must never
+   * become an outage. ADR 0004 §4 argues the asymmetry.)
+   */
+  CHECKPOINT_MISMATCH,
+
   /** A record's payload is larger than the format allows, which no writer of this version emits. */
   OVERLONG_PAYLOAD
 }

@@ -519,7 +519,7 @@ public final class CrashHarness {
         return problems;
       }
     }
-    int shared = Math.min(reference.size(), recovered.size());
+    int shared = (int) Math.min(reference.size(), recovered.size());
     List<JournalEvent> referenceEvents = reference.events();
     List<JournalEvent> recoveredEvents = recovered.events();
     for (int i = 0; i < shared; i++) {

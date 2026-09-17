@@ -101,7 +101,7 @@ public final class OpApplier {
     Prediction expected = model.predict(resolved);
 
     String digestBefore = digests.stateDigest(ledger);
-    int eventsBefore = ledger.size();
+    long eventsBefore = ledger.size();
     Map<AccountId, Money> balancesBefore = ledger.balances();
     List<Account> accountsBefore = ledger.accounts();
 
@@ -215,7 +215,7 @@ public final class OpApplier {
    */
   private void assertUntouched(
       String digestBefore,
-      int eventsBefore,
+      long eventsBefore,
       Map<AccountId, Money> balancesBefore,
       List<Account> accountsBefore,
       String what) {
