@@ -171,7 +171,7 @@ public final class TransferDemo {
   /** Posts something that must be refused, and proves the ledger did not move. */
   private static void refuse(
       InMemoryLedger ledger, Transaction candidate, RejectionReason expected) {
-    int eventsBefore = ledger.size();
+    long eventsBefore = ledger.size();
     Map<AccountId, Money> balancesBefore = ledger.balances();
     try {
       ledger.post(candidate);
