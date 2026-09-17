@@ -6,27 +6,47 @@ import dev.ledgerx.domain.AccountKind;
 import dev.ledgerx.domain.Entry;
 import dev.ledgerx.domain.InMemoryLedger;
 import dev.ledgerx.domain.JournalEvent;
+import dev.ledgerx.domain.IdempotencyKey;
+import dev.ledgerx.domain.MerchantId;
 import dev.ledgerx.domain.Money;
 import dev.ledgerx.domain.RejectionReason;
 import dev.ledgerx.domain.RejectedTransactionException;
+import dev.ledgerx.wal.FsyncPolicy;
 import dev.ledgerx.domain.Transaction;
+import dev.ledgerx.idempotency.IdempotencyConflictException;
+import dev.ledgerx.idempotency.IdempotencyPolicy;
+import dev.ledgerx.idempotency.IdempotentReceipt;
+import dev.ledgerx.journal.DurableLedger;
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.time.Clock;
+import java.time.Duration;
+import java.time.Instant;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 
 /**
  * {@code make demo}: a two-account transfer, posted to an in-memory ledger, with the balances
- * and the whole journal printed afterwards.
+ * and the whole journal printed afterwards — and, since the idempotency ticket, a fourth act
+ * that does the same work against a durable ledger on disk, under a key.
  *
  * <p>It is a demonstration, not a test — but it demonstrates by asserting. Every claim it
  * prints (Σ balances = 0, the index equals a fold of the log, a refused transaction changed
- * nothing) is checked before it is printed, and the program exits non-zero if a check fails,
- * so a demo that lies cannot get through CI.
+ * nothing, a retried payout replayed rather than re-executed) is checked before it is
+ * printed, and the program exits non-zero if a check fails, so a demo that lies cannot get
+ * through CI.
  *
- * <p>Nothing here reads a clock, a file, a socket or a random number generator: the same
- * program prints the same bytes on every run. That determinism is not an accident of the demo
- * being small — it is the property the replay ticket needs of the real thing, and it is why
- * the domain model has no timestamp in it.
+ * <p>Nothing here reads a wall clock, a socket or a random number generator: the idempotency
+ * act runs on a clock the demo itself fixes, and its directory is a scratch one whose name is
+ * never printed. The same program prints the same bytes on every run. That determinism is not
+ * an accident of the demo being small — it is the property the replay ticket needs of the real
+ * thing, and it is why the capture instant of a key binding is supplied by the caller's clock
+ * rather than read from the wall.
  */
 public final class TransferDemo {
 
@@ -35,12 +55,14 @@ public final class TransferDemo {
   public static void main(String[] args) {
     InMemoryLedger ledger = new InMemoryLedger();
 
-    heading("ledger-x demo — a two-account transfer, in memory");
+    heading("ledger-x demo — a two-account transfer, and a retried payout under a key");
     System.out.println(
         "One append-only event log, balances derived from it, Σ balances = 0 after every");
     System.out.println(
-        "step. Nothing here is durable: ADR 0002 decides what the model is, and the WAL,");
-    System.out.println("checkpoint and concurrency tickets decide what happens to it on disk.");
+        "step. The first three acts are in memory — ADR 0002 decides what the model is —");
+    System.out.println(
+        "and the last is durable: the same posting under an idempotency key, one WAL record,");
+    System.out.println("replayed across a retry and a recovery, and refused when it diverges.");
 
     section("open the accounts");
     AccountId capital = open(ledger, "capital", AccountKind.EQUITY);
@@ -110,6 +132,8 @@ public final class TransferDemo {
                 Entry.credit(settlement, Money.ofMinor(1_000L)))),
         RejectionReason.UNKNOWN_ACCOUNT);
 
+    durableIdempotencyAct();
+
     section("the ledger, in append order — sequence numbers are positions, not fields");
     printJournal(ledger);
 
@@ -128,6 +152,169 @@ public final class TransferDemo {
         "   events " + ledger.size() + ", none of them ever edited, none of them removable");
     System.out.println();
     System.out.println("demo ok");
+  }
+
+  /**
+   * The idempotency act (ADR 0005): one payout, under a key, against a durable ledger.
+   *
+   * <p>Four things happen, and each one is asserted, not narrated: the first attempt posts and
+   * binds; a retry of the same key and body replays the stored response without appending a
+   * byte; the same key with a different body is refused — the 409, this ledger's one deliberate
+   * divergence from Stripe, because a 200-replay there would have silently returned the first
+   * payout for a request that meant a different one; and after the ledger is closed and
+   * reopened — a crash and recovery, without the crash — the retry still replays the record at
+   * the same LSN.
+   */
+  private static void durableIdempotencyAct() {
+    section("the durable act: a payout under an idempotency key, retried, mutated, recovered");
+    System.out.println(
+        "   a scratch directory, per-commit fsync, and a clock fixed by the demo so that");
+    System.out.println(
+        "   every run of this act prints the same bytes. The key scopes to one merchant:");
+    System.out.println(
+        "   (atelier, payout-2026-09-17-001) is the identity here, not the key alone.");
+    Path dir;
+    try {
+      dir = Files.createTempDirectory("ledger-x-demo");
+    } catch (IOException couldNot) {
+      throw new UncheckedIOException(couldNot);
+    }
+    Clock clock = Clock.fixed(Instant.ofEpochMilli(1_758_067_200_000L), ZoneOffset.UTC);
+    IdempotencyPolicy policy = IdempotencyPolicy.of(clock, Duration.ofHours(24));
+    MerchantId merchant = MerchantId.of("atelier");
+    IdempotencyKey key = IdempotencyKey.of("payout-2026-09-17-001");
+    Transaction payout =
+        Transaction.transfer(
+            AccountId.of("demo-settlement"),
+            AccountId.of("demo-payable"),
+            Money.ofMinor(25_000L));
+    try {
+      long logBytes;
+      IdempotentReceipt first;
+      IdempotentReceipt retry;
+      IdempotentReceipt recovered;
+      try (DurableLedger durable =
+          DurableLedger.open(dir, FsyncPolicy.PER_COMMIT, true,
+              dev.ledgerx.checkpoint.CheckpointPolicy.MANUAL, policy)) {
+        durable.openAccount(AccountId.of("demo-settlement"), AccountKind.ASSET);
+        durable.openAccount(AccountId.of("demo-payable"), AccountKind.LIABILITY);
+
+        System.out.println();
+        System.out.println("   attempt 1 — the client's first try, which posts:");
+        first = durable.postIdempotent(merchant, key, payout);
+        printReceipt(first);
+        if (first.replayed() || first.originalLsn() != 3L) {
+          throw new AssertionError("the first attempt did not post as record 3");
+        }
+        logBytes = Files.size(dir.resolve(dev.ledgerx.wal.Wal.FILE_NAME));
+
+        System.out.println();
+        System.out.println("   attempt 2 — the client times out and retries the same body:");
+        retry = durable.postIdempotent(merchant, key, payout);
+        printReceipt(retry);
+        if (!retry.replayed() || retry.originalLsn() != first.originalLsn()) {
+          throw new AssertionError("the retry did not replay record " + first.originalLsn());
+        }
+        long afterRetry = Files.size(dir.resolve(dev.ledgerx.wal.Wal.FILE_NAME));
+        if (afterRetry != logBytes) {
+          throw new AssertionError(
+              "the replay appended " + (afterRetry - logBytes) + " byte(s)");
+        }
+        System.out.println("           the log is still " + logBytes + " bytes: a replay is a");
+        System.out.println("           read, not a write, and the money moved exactly once.");
+
+        System.out.println();
+        System.out.println("   attempt 3 — a client bug reuses the key for a different amount:");
+        try {
+          durable.postIdempotent(
+              merchant, key,
+              Transaction.transfer(
+                  AccountId.of("demo-settlement"),
+                  AccountId.of("demo-payable"),
+                  Money.ofMinor(25_001L)));
+          throw new AssertionError("a mutated body under a bound key was accepted");
+        } catch (IdempotencyConflictException conflict) {
+          System.out.println("           refused with 409: " + conflict.key().value());
+          System.out.println(
+              "           the key is bound to fingerprint " + brief(conflict.boundTo()));
+          System.out.println(
+              "           the request carried fingerprint " + brief(conflict.presented()));
+          System.out.println(
+              "           a 200-replay here would have answered a 250.01 request with the");
+          System.out.println(
+              "           250.00 payout — a divergence nobody notices until reconciliation.");
+        }
+      }
+
+      System.out.println();
+      System.out.println("   attempt 4 — the ledger closed and reopened, then retried again:");
+      try (DurableLedger durable =
+          DurableLedger.open(dir, FsyncPolicy.PER_COMMIT, true,
+              dev.ledgerx.checkpoint.CheckpointPolicy.MANUAL, policy)) {
+        recovered = durable.postIdempotent(merchant, key, payout);
+        printReceipt(recovered);
+        if (!recovered.replayed()
+            || recovered.originalLsn() != first.originalLsn()
+            || recovered.capturedAtMillis() != first.capturedAtMillis()) {
+          throw new AssertionError("the recovery did not replay record " + first.originalLsn());
+        }
+        long afterRecovery = Files.size(dir.resolve(dev.ledgerx.wal.Wal.FILE_NAME));
+        if (afterRecovery != logBytes) {
+          throw new AssertionError("the recovered replay appended bytes");
+        }
+        Map<AccountId, Money> balances = durable.ledger().balances();
+        if (balances.size() != 2
+            || balances.get(AccountId.of("demo-settlement")).minorUnits() != -25_000L
+            || balances.get(AccountId.of("demo-payable")).minorUnits() != 25_000L) {
+          throw new AssertionError("the recovered balances are wrong: " + balances);
+        }
+        durable.ledger().audit();
+        System.out.println(
+            "           one posting for one key, across a retry, a refusal and a recovery:");
+        System.out.println(
+            "           Σ balances = " + durable.ledger().totalBalance().minorUnits()
+                + ", audit() silent, the log still " + logBytes + " bytes.");
+      }
+    } catch (IOException couldNot) {
+      throw new UncheckedIOException(couldNot);
+    } finally {
+      deleteTree(dir);
+    }
+  }
+
+  private static void printReceipt(IdempotentReceipt receipt) {
+    System.out.println(
+        "           "
+            + (receipt.replayed() ? "replayed" : "posted")
+            + " — record "
+            + receipt.originalLsn()
+            + " holds the response, captured at "
+            + receipt.capturedAtMillis()
+            + "ms, "
+            + receipt.transaction().entries().size()
+            + " entries, "
+            + render(receipt.transaction().totalDebits()));
+  }
+
+  private static String brief(dev.ledgerx.domain.RequestFingerprint fingerprint) {
+    return fingerprint.hex().substring(0, 16) + "…";
+  }
+
+  private static void deleteTree(Path root) {
+    if (root == null || !Files.exists(root)) {
+      return;
+    }
+    try (var walk = Files.walk(root)) {
+      walk.sorted(Comparator.reverseOrder()).forEach(p -> {
+        try {
+          Files.deleteIfExists(p);
+        } catch (IOException ignored) {
+          // a scratch directory that cannot be fully cleaned does not fail the demo
+        }
+      });
+    } catch (IOException ignored) {
+      // the same
+    }
   }
 
   // --- the four operations, each printing what it did ----------------------------------

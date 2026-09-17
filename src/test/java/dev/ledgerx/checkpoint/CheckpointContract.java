@@ -4,6 +4,7 @@ import dev.ledgerx.domain.AccountId;
 import dev.ledgerx.domain.AccountKind;
 import dev.ledgerx.domain.InMemoryLedger;
 import dev.ledgerx.domain.Money;
+import dev.ledgerx.domain.Transaction;
 import dev.ledgerx.journal.DurableLedger;
 import dev.ledgerx.journal.Replay;
 import dev.ledgerx.wal.FsyncPolicy;
@@ -26,7 +27,9 @@ import java.util.List;
  * <p>{@link dev.ledgerx.checkpoint.crash.LsnBoundaryHarness} asks whether a random kill can find a
  * case nobody thought of; this file asks the questions the ADR answers, at exact bytes, so that
  * "the state section is hashed and the log prefix is hashed and they are different questions" is a
- * line in a test report rather than a paragraph nobody re-reads. Twelve checks, all deterministic,
+ * line in a test report rather than a paragraph nobody re-reads. Thirteen checks, all
+ * deterministic,
+ * the thirteenth added by ADR 0005 to hold the format's newest section to the same standard,
  * and the hostile inputs are edits of a real checkpoint's bytes rather than files assembled through
  * the writer — otherwise the writer would be testing itself.
  *
@@ -81,6 +84,9 @@ public final class CheckpointContract {
     check(
         "the state hash pins the canonical bytes, opening order included",
         CheckpointContract::hashPinsTheBytes);
+    check(
+        "the timing section pairs with the bindings, which the hash pins",
+        CheckpointContract::timingPairsWithBindings);
     check("a restored ledger audits and can go on", CheckpointContract::restoredLedgerAudits);
     check(
         "checkpoint plus tail equals a replay from scratch",
@@ -158,15 +164,26 @@ public final class CheckpointContract {
         WalFormat.intAt(bytes, 32) == section.length,
         "the header's state length is not the section's");
     require(
-        WalFormat.intAt(bytes, 36) == 0,
-        "the state section's reserved word is not zero");
+        WalFormat.intAt(bytes, 36) == checkpoint.captureInstants().size() * 8,
+        "the header's timing length is not one u64 per binding");
     require(
         Arrays.equals(Arrays.copyOfRange(bytes, 40, 72), checkpoint.walDigestUnsafe()),
         "the header's log digest is not the checkpoint's");
     require(
         Arrays.equals(
-            Arrays.copyOfRange(bytes, CheckpointFormat.HEADER_BYTES, bytes.length - 36), section),
+            Arrays.copyOfRange(
+                bytes, CheckpointFormat.HEADER_BYTES, CheckpointFormat.HEADER_BYTES + section
+                    .length),
+            section),
         "the state section is not the canonical bytes");
+    require(
+        Arrays.equals(
+            Arrays.copyOfRange(
+                bytes,
+                CheckpointFormat.HEADER_BYTES + section.length,
+                bytes.length - CheckpointFormat.TRAILER_BYTES),
+            new byte[0]),
+        "a binding-less history should hold no timing bytes");
     require(
         checkpoint.coveredBytes() == ceiling,
         "coverage " + checkpoint.coveredBytes() + " is not the end of frame "
@@ -183,7 +200,7 @@ public final class CheckpointContract {
     require(
         file.getFileName().toString().equals(CheckpointFormat.nameFor(checkpoint.lastLsn())),
         "the file is not named for its watermark");
-    return "72 + " + section.length + " + 36 bytes, named " + file.getFileName();
+    return "72 + " + section.length + " + 0 + 36 bytes, named " + file.getFileName();
   }
 
   private static String roundTrips(Path dir) throws Exception {
@@ -215,7 +232,8 @@ public final class CheckpointContract {
     base = Files.readAllBytes(checkpointFile(dir));
     List<String> named = new ArrayList<>();
     named.add(expectRefusal(flip(base, 0), CheckpointRefusal.BAD_MAGIC));
-    named.add(expectRefusal(withByte(base, 4, (byte) 2), CheckpointRefusal.BAD_HEADER));
+    named.add(expectRefusal(withByte(base, 4, (byte) 1), CheckpointRefusal.BAD_HEADER));
+    named.add(expectRefusal(withByte(base, 4, (byte) 3), CheckpointRefusal.BAD_HEADER));
     named.add(
         expectRefusal(
             Arrays.copyOf(base, base.length - 1), CheckpointRefusal.LENGTH_MISMATCH));
@@ -225,7 +243,7 @@ public final class CheckpointContract {
     byte[] digestEdited = flip(base, base.length - WalFormat.CRC_BYTES - 1);
     recomputeCrc(digestEdited);
     named.add(expectRefusal(digestEdited, CheckpointRefusal.STATE_DIGEST_MISMATCH));
-    byte[] versionEdited = withByte(base, CheckpointFormat.HEADER_BYTES, (byte) 2);
+    byte[] versionEdited = withByte(base, CheckpointFormat.HEADER_BYTES, (byte) 1);
     rehash(versionEdited);
     named.add(expectRefusal(versionEdited, CheckpointRefusal.STATE_MALFORMED));
     byte[] countEdited = withInt(base, CheckpointFormat.HEADER_BYTES + 9, -1);
@@ -425,6 +443,108 @@ public final class CheckpointContract {
     }
   }
 
+  /**
+   * The idempotency half of the format (ADR 0005 §6): binding rows inside the hashed state
+   * section, one capture instant per binding in a timing section the hash does not cover, and a
+   * named refusal when the two sections disagree about how many bindings there are.
+   *
+   * <p>The {@code TIMING_MISMATCH} surgery is the interesting one: the edit touches only timing
+   * bytes and the header word that counts them — the state section, its hash and the file length
+   * all stay consistent — so the file is internally valid in every layer the integrity checks
+   * cover, and only the pairing check can catch it. That is the argument for the check's
+   * existence, made as a test rather than a paragraph.
+   */
+  private static String timingPairsWithBindings(Path dir) throws Exception {
+    java.time.Clock clock = java.time.Clock.fixed(java.time.Instant.ofEpochMilli(1_000L),
+        java.time.ZoneOffset.UTC);
+    Checkpoint checkpoint;
+    Path file;
+    try (DurableLedger ledger =
+        DurableLedger.open(
+            dir, POLICY, true, CheckpointPolicy.MANUAL,
+            dev.ledgerx.idempotency.IdempotencyPolicy.of(clock,
+                java.time.Duration.ofHours(24)))) {
+      openTwoAccounts(ledger);
+      ledger.postIdempotent(
+          dev.ledgerx.domain.MerchantId.of("guild"),
+          dev.ledgerx.domain.IdempotencyKey.of("payout-1"),
+          Transaction.transfer(
+              AccountId.of("acct-0"), AccountId.of("acct-1"), Money.ofMinor(5_000L)));
+      ledger.postIdempotent(
+          dev.ledgerx.domain.MerchantId.of("atelier"),
+          dev.ledgerx.domain.IdempotencyKey.of("payout-2"),
+          Transaction.transfer(
+              AccountId.of("acct-1"), AccountId.of("acct-0"), Money.ofMinor(2_500L)));
+      checkpoint = ledger.checkpoint();
+      file = checkpointFile(dir);
+    }
+    byte[] bytes = Files.readAllBytes(file);
+    int stateBytes = WalFormat.intAt(bytes, 32);
+    int timingBytes = WalFormat.intAt(bytes, 36);
+    require(
+        checkpoint.state().bindingCount() == 2,
+        "the checkpoint does not hold two bindings");
+    require(
+        checkpoint.captureInstants().equals(List.of(1_000L, 1_000L)),
+        "the timing section is not the committed capture instants: "
+            + checkpoint.captureInstants());
+    require(
+        timingBytes == 2 * CheckpointFormat.TIMING_BYTES_PER_BINDING,
+        "the header declares " + timingBytes + " timing bytes for two bindings");
+    require(
+        WalFormat.longAt(bytes, CheckpointFormat.HEADER_BYTES + stateBytes) == 1_000L
+            && WalFormat.longAt(
+                bytes, CheckpointFormat.HEADER_BYTES + stateBytes + 8) == 1_000L,
+        "the timing section does not hold the instants in binding order");
+
+    // The hash pins the bindings themselves: same accounts and balances, different binding order,
+    // different state hash — and one binding gone is a different state too.
+    java.util.List<dev.ledgerx.domain.KeyBinding> rows = checkpoint.state().bindings();
+    LedgerState swapped =
+        new LedgerState(
+            checkpoint.state().accounts(),
+            checkpoint.state().balances(),
+            List.of(rows.get(1), rows.get(0)),
+            checkpoint.state().lastLsn());
+    require(
+        !swapped.stateHash().equals(checkpoint.stateHash()),
+        "swapping the binding order left the state hash alone");
+    LedgerState dropped =
+        new LedgerState(
+            checkpoint.state().accounts(),
+            checkpoint.state().balances(),
+            List.of(rows.get(0)),
+            checkpoint.state().lastLsn());
+    require(
+        !dropped.stateHash().equals(checkpoint.stateHash()),
+        "dropping a binding left the state hash alone");
+
+    // TIMING_MISMATCH: cut one instant out, keep everything the hash covers, recompute the CRC.
+    byte[] mismatched = new byte[bytes.length - 8];
+    System.arraycopy(bytes, 0, mismatched, 0, CheckpointFormat.HEADER_BYTES + stateBytes + 8);
+    System.arraycopy(
+        bytes,
+        bytes.length - CheckpointFormat.TRAILER_BYTES,
+        mismatched,
+        mismatched.length - CheckpointFormat.TRAILER_BYTES,
+        CheckpointFormat.TRAILER_BYTES);
+    WalFormat.putInt(mismatched, 36, 8);
+    WalFormat.putInt(
+        mismatched,
+        mismatched.length - WalFormat.CRC_BYTES,
+        WalFormat.crc32c(mismatched, mismatched.length - 4));
+    try {
+      Checkpoint.decode(mismatched);
+      throw new AssertionError("a timing section that lost an instant was accepted");
+    } catch (CorruptCheckpointException refused) {
+      require(
+          refused.refusal() == CheckpointRefusal.TIMING_MISMATCH,
+          "refused as " + refused.refusal() + ", expected TIMING_MISMATCH — " + refused);
+    }
+    return "2 bindings, 2 instants, order and presence pinned by the hash, and an orphaned"
+        + " instant refused by name";
+  }
+
   private static String restoredLedgerAudits(Path dir) throws Exception {
     InMemoryLedger live = new InMemoryLedger();
     live.openAccount(AccountId.of("acct-0"), AccountKind.ASSET);
@@ -562,9 +682,11 @@ public final class CheckpointContract {
   /** Recomputes the state hash and then the CRC, leaving the bytes self-consistent but wrong. */
   private static void rehash(byte[] file) {
     int stateBytes = WalFormat.intAt(file, 32);
+    int timingBytes = WalFormat.intAt(file, 36);
     int at = CheckpointFormat.HEADER_BYTES;
     byte[] digest = Sha256.of(Arrays.copyOfRange(file, at, at + stateBytes));
-    System.arraycopy(digest, 0, file, at + stateBytes, CheckpointFormat.DIGEST_BYTES);
+    System.arraycopy(
+        digest, 0, file, at + stateBytes + timingBytes, CheckpointFormat.DIGEST_BYTES);
     recomputeCrc(file);
   }
 

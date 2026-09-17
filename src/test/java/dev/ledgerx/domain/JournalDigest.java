@@ -137,6 +137,13 @@ public final class JournalDigest {
     if (event instanceof JournalEvent.Posted posted) {
       return "posted:" + canonical(posted.transaction());
     }
+    if (event instanceof JournalEvent.PostedIdempotently keyed) {
+      // The key material is part of what must never mutate after the append, so it is rendered
+      // like the entries: identity, fingerprint, instant, then the transaction.
+      return "keyed:" + keyed.merchant() + "/" + keyed.key() + "/"
+          + keyed.fingerprint().hex() + "/" + keyed.capturedAtMillis() + ":"
+          + canonical(keyed.transaction());
+    }
     throw new AssertionError("an event kind this suite does not know how to render: " + event);
   }
 }

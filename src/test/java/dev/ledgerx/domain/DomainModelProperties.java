@@ -61,6 +61,12 @@ public final class DomainModelProperties {
     JournalEvent.class,
     JournalEvent.AccountOpened.class,
     JournalEvent.Posted.class,
+    JournalEvent.PostedIdempotently.class,
+    MerchantId.class,
+    IdempotencyKey.class,
+    RequestFingerprint.class,
+    KeyBinding.class,
+    BoundKey.class,
     InMemoryLedger.class
   };
 

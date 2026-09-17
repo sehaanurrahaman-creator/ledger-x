@@ -173,7 +173,7 @@ public final class WalRecovery {
                 + " truncatable, because without it no record boundary can be trusted",
             null);
       }
-      checkSegmentHeader(header);
+      int segmentVersion = checkSegmentHeader(header);
 
       byte[] frame = new byte[WalFormat.MAX_FRAME_BYTES];
       while (true) {
@@ -228,6 +228,19 @@ public final class WalRecovery {
               fatal.cause(), position, Lsn.of(nextLsn), fatal.detail(), null);
         }
         WalRecord record = ((WalRecord.ValidFrame) check).record();
+        if (segmentVersion == 1 && record.type() == RecordType.IDEMPOTENT_POSTING) {
+          // The version byte is a promise about the record vocabulary, and this is the check that
+          // keeps it one: a version-1 segment predates this type, so a frame carrying it inside
+          // one is not a version-1 log however well it parses — it is damage wearing a header,
+          // and it stops the scan rather than being folded by a reader that was never asked
+          // whether it understands what it found.
+          throw new UnrecoverableLogException(
+              Corruption.UNKNOWN_RECORD_TYPE, position, record.lsn(),
+              "a version-" + segmentVersion + " segment cannot hold a "
+                  + record.type() + " record; the version byte is a promise about the record"
+                  + " vocabulary (ADR 0005 §4)",
+              null);
+        }
         records.add(record);
         if (record.type() == RecordType.RECOVERY_MARKER) {
           // A marker is a record like any other, and its payload is the log's own account of the
@@ -270,7 +283,15 @@ public final class WalRecovery {
   }
 
   /** Magic, version, header size and CRC — and a reserved field that must still read zero. */
-  private static void checkSegmentHeader(byte[] header) throws UnrecoverableLogException {
+  /**
+   * Magic, version, header size and CRC — and a reserved field that must still read zero.
+   *
+   * <p>Returns the segment's version, because the scan needs it for the one rule that makes the
+   * version byte mean something: a version-1 segment may not hold a record type that did not
+   * exist when version 1 was written (ADR 0005 §4). Without the return, the caller would have to
+   * re-read the byte, and a check that re-derives its input is a check that can be half-updated.
+   */
+  private static int checkSegmentHeader(byte[] header) throws UnrecoverableLogException {
     int magic = WalFormat.intAt(header, 0);
     int version = header[4] & 0xFF;
     int headerSize = WalFormat.shortAt(header, 6);
@@ -284,17 +305,20 @@ public final class WalRecovery {
               + Integer.toHexString(WalFormat.SEGMENT_MAGIC) + " — not a ledger-x WAL",
           null);
     }
-    if (version != WalFormat.FORMAT_VERSION) {
+    if (version < WalFormat.OLDEST_READABLE_FORMAT_VERSION
+        || version > WalFormat.FORMAT_VERSION) {
       throw new UnrecoverableLogException(
           Corruption.BAD_SEGMENT_HEADER, 0L, null,
-          "format version is " + version + " and this build writes " + WalFormat.FORMAT_VERSION,
+          "format version is " + version + " and this build reads "
+              + WalFormat.OLDEST_READABLE_FORMAT_VERSION + " through "
+              + WalFormat.FORMAT_VERSION,
           null);
     }
     if (headerSize != WalFormat.SEGMENT_HEADER_BYTES || reserved != 0) {
       throw new UnrecoverableLogException(
           Corruption.BAD_SEGMENT_HEADER, 0L, null,
           "header size " + headerSize + " and reserved field 0x" + Integer.toHexString(reserved)
-              + " are not what version " + WalFormat.FORMAT_VERSION + " promises",
+              + " are not what version " + version + " promises",
           null);
     }
     if (stored != computed) {
@@ -304,6 +328,7 @@ public final class WalRecovery {
               + Integer.toHexString(computed),
           null);
     }
+    return version;
   }
 
   private static int readAt(DurableChannel in, byte[] dst, long position) throws IOException {

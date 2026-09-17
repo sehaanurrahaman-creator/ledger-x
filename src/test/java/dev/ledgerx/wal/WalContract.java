@@ -35,7 +35,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  * kill can find a case nobody thought of; this file asks the questions the ADR answers, at
  * exact byte
  * offsets, so that "a scribble inside a payload truncates and a scribble inside the header refuses
- * to open" is a line in a test report rather than a paragraph nobody re-reads. Nineteen checks, all
+ * to open" is a line in a test report rather than a paragraph nobody re-reads. Twenty checks, all
  * deterministic, and the hostile inputs are built from raw frames rather than through
  * {@link Wal} —
  * otherwise a format bug would be tested by the code that has it.
@@ -69,6 +69,9 @@ public final class WalContract {
     check("a torn tail is cut and recorded in the log", WalContract::tearIsCutAndRecorded);
     check("a damaged head is refused, never cut", WalContract::headDamageRefusesToOpen);
     check("an unknown record type refuses to open", WalContract::unknownTypeRefusesToOpen);
+    check(
+        "a version-1 log still opens, and the version byte still means something",
+        WalContract::versionOneReadsAndBites);
     check("an lsn hole is a tear, not a gap to step over", WalContract::lsnHoleTruncates);
     check("cutting, not skipping, is what stops resurrection", WalContract::noResurrection);
     check("per-commit fsync forces once per record", WalContract::perCommitForcesOnceEach);
@@ -363,6 +366,86 @@ public final class WalContract {
       throw new AssertionError("type 0 was not refused as an unknown type");
     }
     return "0x7F and 0x00 both stop the scan, and neither is truncated away";
+  }
+
+  /**
+   * The format's compatibility story, in one file (ADR 0005 §4): this build writes version 2 and
+   * reads version 1, so an old log is data, not damage — but the version byte is also a promise
+   * about the record vocabulary, so a version-1 segment carrying the idempotency record is
+   * refused, and a version this build never knew is refused at the header before any record is
+   * read.
+   *
+   * <p>The version-1 fixtures are hand-crafted headers over real encoded frames, not files this
+   * build wrote with a byte patched in — a compatibility promise is about logs produced by an
+   * older build, and the only way to be sure the test means that is to build the header the way
+   * that build would have.
+   */
+  private static String versionOneReadsAndBites(Path dir) throws IOException {
+    Path file = dir.resolve(Wal.FILE_NAME);
+    Transaction posting =
+        Transaction.transfer(AccountId.of("acct-0"), AccountId.of("acct-1"), Money.ofMinor(5L));
+    byte[] posted =
+        rawFrame(1L, RecordType.POSTED.code(), EventCodec.encode(new JournalEvent.Posted(posting)));
+    byte[] keyed =
+        rawFrame(
+            1L,
+            RecordType.IDEMPOTENT_POSTING.code(),
+            EventCodec.encode(
+                new JournalEvent.PostedIdempotently(
+                    dev.ledgerx.domain.MerchantId.of("guild"),
+                    dev.ledgerx.domain.IdempotencyKey.of("payout-1"),
+                    EventCodec.fingerprintOf(posting),
+                    1_000L,
+                    posting)));
+
+    // A version-1 segment header over a POSTED frame: read, one record folded.
+    Files.write(
+        file,
+        concat(headerOfVersion(1), posted),
+        StandardOpenOption.CREATE,
+        StandardOpenOption.TRUNCATE_EXISTING);
+    WalRecovery.Scan read = WalRecovery.scan(file);
+    if (read.records().size() != 1 || read.records().get(0).type() != RecordType.POSTED) {
+      throw new AssertionError("a version-1 log with a posting did not read back as one record");
+    }
+
+    // The same header over the idempotency record: the frame parses, the CRC agrees, and the
+    // scan refuses it anyway — the vocabulary is the version, not a suggestion.
+    Files.write(
+        file,
+        concat(headerOfVersion(1), keyed),
+        StandardOpenOption.CREATE,
+        StandardOpenOption.TRUNCATE_EXISTING);
+    UnrecoverableLogException vocabulary = scanRefuses(file);
+    if (vocabulary.corruption() != Corruption.UNKNOWN_RECORD_TYPE
+        || !vocabulary.getMessage().contains("vocabulary")) {
+      throw new AssertionError(
+          "a version-1 segment carrying the keyed record refused as "
+              + vocabulary.corruption() + ": " + vocabulary.getMessage());
+    }
+
+    // A version this build never wrote: refused at the header, before any record is read.
+    Files.write(
+        file,
+        concat(headerOfVersion(3), posted),
+        StandardOpenOption.CREATE,
+        StandardOpenOption.TRUNCATE_EXISTING);
+    UnrecoverableLogException future = scanRefuses(file);
+    if (future.corruption() != Corruption.BAD_SEGMENT_HEADER
+        || !future.getMessage().contains("reads")) {
+      throw new AssertionError(
+          "a version-3 segment refused as " + future.corruption() + ": " + future.getMessage());
+    }
+    return "v1 + a posting reads, v1 + the keyed record is refused as vocabulary damage,"
+        + " v3 is refused at the header";
+  }
+
+  /** A segment header of the asked version, CRC'd the way the writer computes it. */
+  private static byte[] headerOfVersion(int version) {
+    byte[] header = WalFormat.encodeSegmentHeader();
+    header[4] = (byte) version;
+    WalFormat.putInt(header, 12, WalFormat.crc32c(header, 12));
+    return header;
   }
 
   private static String lsnHoleTruncates(Path dir) throws IOException {

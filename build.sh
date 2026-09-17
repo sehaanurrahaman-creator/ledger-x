@@ -2,7 +2,8 @@
 #
 # ledger-x — one command to build and test.
 #
-#   ./build.sh            lint, compile, the substrate contract, the WAL contract, the properties
+#   ./build.sh            lint, compile, the five suites: substrate, WAL, checkpoint,
+#                         idempotency contracts and the properties
 #   ./build.sh compile    lint and compile, run nothing
 #   ./build.sh crash      the kill -9 micro-harness: 1,000 random kill/recover cycles per policy
 #   ./build.sh boundary   the checkpoint harness: every prefix of a history, crash, recover, hash
@@ -33,8 +34,10 @@ readonly CONTRACT_ENTRY="dev.ledgerx.substrate.SubstrateContract"
 readonly WAL_CONTRACT_ENTRY="dev.ledgerx.wal.WalContract"
 readonly CRASH_ENTRY="dev.ledgerx.wal.crash.CrashHarness"
 readonly CHECKPOINT_CONTRACT_ENTRY="dev.ledgerx.checkpoint.CheckpointContract"
+readonly IDEMPOTENCY_CONTRACT_ENTRY="dev.ledgerx.idempotency.IdempotencyContract"
 readonly BOUNDARY_ENTRY="dev.ledgerx.checkpoint.crash.LsnBoundaryHarness"
 readonly PROPERTIES_ENTRY="dev.ledgerx.domain.DomainModelProperties"
+readonly IDEMPOTENCY_PROPERTIES_ENTRY="dev.ledgerx.idempotency.IdempotencyProperties"
 readonly DEMO_ENTRY="dev.ledgerx.demo.TransferDemo"
 readonly JAVAC_FLAGS=(--release "${RELEASE}" -Xlint:all -Werror -encoding UTF-8)
 
@@ -223,6 +226,23 @@ do_properties() {
   annotate "${log_file}"
 }
 
+do_idempotency_contract() {
+  local log_file="${BUILD_DIR}/idempotency-contract.log"
+  run_main "idempotency contract" "${IDEMPOTENCY_CONTRACT_ENTRY}" "${log_file}"
+  annotate "${log_file}"
+}
+
+do_idempotency_properties() {
+  local log_file="${BUILD_DIR}/idempotency-properties.log"
+  campaign_opts
+  run_main \
+    "idempotency properties" \
+    "${IDEMPOTENCY_PROPERTIES_ENTRY}" \
+    "${log_file}" \
+    "${CAMPAIGN_OPTS[@]+"${CAMPAIGN_OPTS[@]}"}"
+  annotate "${log_file}"
+}
+
 do_demo() {
   local log_file="${BUILD_DIR}/demo.log"
   run_main "demo" "${DEMO_ENTRY}" "${log_file}"
@@ -232,7 +252,9 @@ do_test() {
   do_contract_test
   do_wal_contract
   do_checkpoint_contract
+  do_idempotency_contract
   do_properties
+  do_idempotency_properties
 }
 
 do_crash() {
@@ -286,12 +308,21 @@ do_boundary() {
 
 do_campaign() {
   local log_file="${BUILD_DIR}/property-test.log"
+  local idem_log="${BUILD_DIR}/idempotency-properties.log"
   log "domain model properties: extended campaign (${CAMPAIGN_TRIALS} cases x \
 ${CAMPAIGN_OPERATIONS} operations)"
   LEDGER_X_TRIALS="${LEDGER_X_TRIALS:-${CAMPAIGN_TRIALS}}" \
   LEDGER_X_OPERATIONS="${LEDGER_X_OPERATIONS:-${CAMPAIGN_OPERATIONS}}" \
     do_properties
   echo "campaign log: ${log_file}"
+  # The idempotency theorem at the same scale: retries, conflicts, expiries, reopens and
+  # checkpoints against a durable ledger, ~10x the CI campaign.
+  log "idempotency properties: extended campaign (${CAMPAIGN_TRIALS} cases x \
+${CAMPAIGN_OPERATIONS} operations)"
+  LEDGER_X_TRIALS="${LEDGER_X_TRIALS:-${CAMPAIGN_TRIALS}}" \
+  LEDGER_X_OPERATIONS="${LEDGER_X_OPERATIONS:-${CAMPAIGN_OPERATIONS}}" \
+    do_idempotency_properties
+  echo "campaign log: ${idem_log}"
 }
 
 do_build() {

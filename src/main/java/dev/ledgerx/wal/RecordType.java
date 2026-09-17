@@ -10,10 +10,15 @@ package dev.ledgerx.wal;
  * records what that costs on upgrade (a new reader must accept old logs; an old reader must
  * refuse a new one, and refusing is safe because the ack rule never depends on it).
  *
- * <p>Two of these are ledger events, in {@link dev.ledgerx.domain.JournalEvent}'s exact shape —
+ * <p>Three of these are ledger events, in {@link dev.ledgerx.domain.JournalEvent}'s exact shape —
  * ADR 0002 decided the event log and said the record format was this ticket's, so the mapping is
- * one-to-one and adds nothing. The third is log-internal: it moves no money and is consumed by
+ * one-to-one and adds nothing. The fourth is log-internal: it moves no money and is consumed by
  * recovery itself, so it never reaches the fold.
+ *
+ * <p>Adding the fourth event type, {@code IDEMPOTENT_POSTING}, is what moved the segment version
+ * from 1 to 2 (ADR 0005 §4): the rule this table has always stated is that a new type is a
+ * format-version change, so an old reader refuses a new log at the header rather than at the
+ * first record it cannot honour, and a new reader still accepts every old log.
  */
 public enum RecordType {
 
@@ -28,7 +33,18 @@ public enum RecordType {
    * ledger event; it exists so that the log records what recovery did to it, which is the only
    * way a post-mortem can tell "the writer died here" from "recovery cut here, and here is why".
    */
-  RECOVERY_MARKER(0x03);
+  RECOVERY_MARKER(0x03),
+
+  /**
+   * A {@code JournalEvent.PostedIdempotently}: a whole transaction <em>and the idempotency key it
+   * was posted under</em> — scope, key, capture instant, request fingerprint, entries — in one
+   * record, because the posting and the binding must commit in the same append, the same force
+   * and the same ack (ADR 0005 §4).
+   *
+   * <p>A version-1 segment may not hold this type: the version byte is a promise about the
+   * record vocabulary, and recovery enforces it.
+   */
+  IDEMPOTENT_POSTING(0x04);
 
   /**
    * Zero is not a type: it is what an unwritten or zeroed byte reads as, and it must never

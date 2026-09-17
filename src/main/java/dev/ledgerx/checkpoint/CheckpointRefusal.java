@@ -49,6 +49,14 @@ public enum CheckpointRefusal {
    */
   WAL_DIGEST_MISMATCH,
 
+  /**
+   * The timing section does not pair with the state section's bindings — a count that disagrees,
+   * or bytes a section did not order. The timing section is the one part of the file the state
+   * hash does not cover (ADR 0005 §6), so its pairing with the bindings is checked directly:
+   * one instant per binding, in the same order, or the file is not what it says it is.
+   */
+  TIMING_MISMATCH,
+
   /** The file could not be read at all — vanished under a garbage collection, or unreadable. */
   UNREADABLE
 }

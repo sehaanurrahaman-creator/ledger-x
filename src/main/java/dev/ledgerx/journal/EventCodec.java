@@ -1,11 +1,15 @@
 package dev.ledgerx.journal;
 
+import dev.ledgerx.checkpoint.Sha256;
 import dev.ledgerx.domain.Account;
 import dev.ledgerx.domain.AccountId;
 import dev.ledgerx.domain.AccountKind;
 import dev.ledgerx.domain.Entry;
+import dev.ledgerx.domain.IdempotencyKey;
 import dev.ledgerx.domain.JournalEvent;
+import dev.ledgerx.domain.MerchantId;
 import dev.ledgerx.domain.Money;
+import dev.ledgerx.domain.RequestFingerprint;
 import dev.ledgerx.domain.Side;
 import dev.ledgerx.domain.Transaction;
 import dev.ledgerx.wal.Corruption;
@@ -15,10 +19,11 @@ import dev.ledgerx.wal.WalFormat;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 
 /**
- * The two ledger event kinds as bytes: ADR 0002's event log, encoded.
+ * The ledger's event kinds as bytes: ADR 0002's event log, encoded — three kinds since ADR 0005.
  *
  * <p>The encoding is fixed-width fields and lengths, no delimiters and no escaping, because
  * {@link AccountId}'s alphabet already excludes every character a textual encoding would need to
@@ -41,15 +46,20 @@ import java.util.List;
  *       domain
  *       has neither, and a clock read inside a record would make replay non-deterministic —
  *       standing design-review question 5 answered for the storage layer as "the log never reads
- *       one, so there is nothing for two nodes' clocks to disagree about".
+ *       one, so there is nothing for two nodes' clocks to disagree about". The one exception is
+ *       the idempotency record's <em>capture instant</em> (ADR 0005 §5): a value the writer
+ *       committed, not a time this codec reads — replay reproduces the bytes exactly, and the
+ *       determinism rule survives because nothing in the fold ever consults a clock.
  *   <li><strong>No currency code.</strong> One currency and a constant exponent (ADR 0002 §2),
  *       so the
  *       field would be identical in every record. Naming it is the same change as widening money to
  *       128 bits: a format change, deferred with the reason recorded rather than forgotten.
- *   <li><strong>No idempotency key.</strong> Ticket #7's, and it arrives as a record type beside
- *       these two, not as a field inside a transaction — because a key must be durable in the
- *       same
- *       unit of commit as the posting, and two fields in one record give that for free.
+ *   <li><strong>The idempotency key is a record type, not a field inside a transaction.</strong>
+ *       ADR 0002 deferred it to the idempotency ticket, and the shape it arrives in is the one
+ *       this javadoc always predicted: the key and the entries it guards are <em>one record</em>,
+ *       because a key must be durable in the same unit of commit as the posting — one append,
+ *       one force, one ack — and a crash between two records reopens the double-post window
+ *       (ADR 0005 §4).
  *   <li><strong>No checksum of the decoded event.</strong> The frame's CRC32C covers the payload
  *       already; a second digest would be a field a corrupt writer could leave consistent.
  * </ul>
@@ -62,12 +72,34 @@ public final class EventCodec {
   /** Bytes an entry costs beyond its account id: length, side, amount. */
   public static final int ENTRY_FIXED_BYTES = 10;
 
+  /**
+   * The idempotency record's fixed bytes beyond the names and the entry list: the two length
+   * bytes and the capture instant and the fingerprint. The entry count is not here — it is part
+   * of the entry-list bytes a keyed posting shares byte for byte with a plain one, so counting
+   * it here as well would allocate two bytes the decoder would rightly refuse to consume.
+   */
+  public static final int IDEMPOTENT_FIXED_BYTES =
+      1 + 1 + 8 + RequestFingerprint.BYTES;
+
+  /**
+   * The operation tag a request fingerprint starts with: {@code 'P'} for a posting. The tag is
+   * what keeps fingerprints honest across operation kinds, the day a key can be used for
+   * something other than a posting — a body that matches by bytes but means a different
+   * operation must not compare equal.
+   */
+  public static final int REQUEST_TAG_POSTING = 'P';
+
   private EventCodec() {}
 
   /** The record type a ledger event serializes as. */
   public static RecordType typeOf(JournalEvent event) {
-    return event instanceof JournalEvent.AccountOpened ? RecordType.ACCOUNT_OPENED
-        : RecordType.POSTED;
+    if (event instanceof JournalEvent.AccountOpened) {
+      return RecordType.ACCOUNT_OPENED;
+    }
+    if (event instanceof JournalEvent.PostedIdempotently) {
+      return RecordType.IDEMPOTENT_POSTING;
+    }
+    return RecordType.POSTED;
   }
 
   /** The payload bytes for one event, ready for {@code Wal.append}. */
@@ -78,7 +110,29 @@ public final class EventCodec {
     if (event instanceof JournalEvent.Posted posted) {
       return encodePosted(posted.transaction());
     }
+    if (event instanceof JournalEvent.PostedIdempotently keyed) {
+      return encodePostedIdempotently(keyed);
+    }
     throw new IllegalArgumentException("an event kind this codec does not know: " + event);
+  }
+
+  /**
+   * The request fingerprint of a posting: SHA-256 over {@code u8 REQUEST_TAG_POSTING} followed by
+   * the canonical entry list — the same bytes a {@code POSTED} payload carries — so "the same
+   * body" means "the same entries, in the order the client sent them", and nothing else.
+   *
+   * <p>This is the only place a fingerprint is computed, on purpose. Two computations that could
+   * disagree — one for the binding, one for the check — would turn every replay into a
+   * conflict,
+   * so the derivation lives beside the encoding it digests, and everything else in the repository
+   * compares {@link RequestFingerprint}s without knowing how they were made.
+   */
+  public static RequestFingerprint fingerprintOf(Transaction transaction) {
+    byte[] body = encodePosted(transaction);
+    byte[] tagged = new byte[1 + body.length];
+    tagged[0] = (byte) REQUEST_TAG_POSTING;
+    System.arraycopy(body, 0, tagged, 1, body.length);
+    return RequestFingerprint.of(Sha256.of(tagged));
   }
 
   private static byte[] encodeOpenAccount(Account account) {
@@ -114,6 +168,47 @@ public final class EventCodec {
   }
 
   /**
+   * The keyed posting: the scope, the key, the capture instant, the fingerprint of the body, and
+   * the entries — one payload, so one frame, so one commit (ADR 0005 §4).
+   *
+   * <p>The entry list is byte-identical to a {@code POSTED} payload's, which is not a coincidence
+   * to tolerate but a rule to keep: {@link #fingerprintOf} digests exactly those bytes, so a keyed
+   * and a plain encoding of one transaction must agree for the fingerprint of a request to be
+   * stable across how it was filed.
+   */
+  private static byte[] encodePostedIdempotently(JournalEvent.PostedIdempotently event) {
+    byte[] merchant = text(event.merchant().value(), MerchantId.MAX_LENGTH, "merchant id");
+    byte[] key = text(event.key().value(), IdempotencyKey.MAX_LENGTH, "idempotency key");
+    byte[] entries = encodePosted(event.transaction());
+    byte[] payload =
+        new byte[IDEMPOTENT_FIXED_BYTES + merchant.length + key.length + entries.length];
+    int at = 0;
+    payload[at++] = (byte) merchant.length;
+    System.arraycopy(merchant, 0, payload, at, merchant.length);
+    at += merchant.length;
+    payload[at++] = (byte) key.length;
+    System.arraycopy(key, 0, payload, at, key.length);
+    at += key.length;
+    WalFormat.putLong(payload, at, event.capturedAtMillis());
+    at += 8;
+    System.arraycopy(event.fingerprint().bytesUnsafe(), 0, payload, at,
+        RequestFingerprint.BYTES);
+    at += RequestFingerprint.BYTES;
+    System.arraycopy(entries, 0, payload, at, entries.length);
+    return payload;
+  }
+
+  /** ASCII bytes of a name this format carries, bounded by its type's documented ceiling. */
+  private static byte[] text(String value, int maxLength, String what) {
+    byte[] bytes = value.getBytes(StandardCharsets.US_ASCII);
+    if (bytes.length < 1 || bytes.length > maxLength) {
+      throw new IllegalArgumentException(
+          "a " + what + " of " + bytes.length + " bytes is outside 1.." + maxLength);
+    }
+    return bytes;
+  }
+
+  /**
    * Decodes one record's payload, insisting it is the event its frame type promises.
    *
    * @throws UnrecoverableLogException if the bytes do not describe what the type says they do,
@@ -142,6 +237,37 @@ public final class EventCodec {
       return new JournalEvent.AccountOpened(
           new Account(accountId(payload, at, idLength, lsn), kinds[kindOrdinal]));
     }
+    if (type == RecordType.IDEMPOTENT_POSTING) {
+      if (length < IDEMPOTENT_FIXED_BYTES) {
+        throw malformed(
+            lsn, "a keyed posting needs at least " + IDEMPOTENT_FIXED_BYTES + " bytes");
+      }
+      int merchantLength = payload[at++] & 0xFF;
+      if (at + merchantLength > end) {
+        throw malformed(lsn, "the merchant runs past the end of the payload");
+      }
+      MerchantId merchant =
+          MerchantId.of(textOf(payload, at, merchantLength, lsn, MerchantId.MAX_LENGTH));
+      at += merchantLength;
+      int keyLength = payload[at++] & 0xFF;
+      if (at + keyLength + 8 + RequestFingerprint.BYTES + 2 > end) {
+        throw malformed(lsn, "the key, the instant or the fingerprint runs past the payload");
+      }
+      IdempotencyKey key =
+          IdempotencyKey.of(textOf(payload, at, keyLength, lsn, IdempotencyKey.MAX_LENGTH));
+      at += keyLength;
+      long capturedAtMillis = WalFormat.longAt(payload, at);
+      at += 8;
+      RequestFingerprint fingerprint =
+          RequestFingerprint.of(
+              Arrays.copyOfRange(payload, at, at + RequestFingerprint.BYTES));
+      at += RequestFingerprint.BYTES;
+      int count = WalFormat.shortAt(payload, at);
+      at += 2;
+      List<Entry> entries = decodeEntries(payload, at, count, end, lsn);
+      return new JournalEvent.PostedIdempotently(
+          merchant, key, fingerprint, capturedAtMillis, new Transaction(entries));
+    }
     if (type != RecordType.POSTED) {
       throw malformed(lsn, type + " is not a ledger event");
     }
@@ -150,6 +276,19 @@ public final class EventCodec {
     }
     int count = WalFormat.shortAt(payload, at);
     at += 2;
+    List<Entry> entries = decodeEntries(payload, at, count, end, lsn);
+    return new JournalEvent.Posted(new Transaction(entries));
+  }
+
+  /**
+   * The entry list both posting records share, decoded once: bounded by the frame, exhausted by
+   * the count, and consumed exactly to the end. One decoder for both types is what makes the
+   * fingerprint's promise — a keyed and a plain encoding of one transaction are the same bytes
+   * —
+   * checkable rather than hoped for.
+   */
+  private static List<Entry> decodeEntries(
+      byte[] payload, int at, int count, int end, long lsn) throws IOException {
     List<Entry> entries = new ArrayList<>(count);
     for (int i = 0; i < count; i++) {
       if (at >= end) {
@@ -174,7 +313,21 @@ public final class EventCodec {
     if (at != end) {
       throw malformed(lsn, (end - at) + " bytes are left over after " + count + " entries");
     }
-    return new JournalEvent.Posted(new Transaction(entries));
+    return entries;
+  }
+
+  /** A length-bounded ASCII name, validated by its type — the decode side of {@link #text}. */
+  private static String textOf(
+      byte[] payload, int at, int length, long lsn, int maxLength) throws IOException {
+    if (length < 1 || length > maxLength) {
+      throw malformed(lsn, "a name of " + length + " bytes is outside 1.." + maxLength);
+    }
+    for (int i = 0; i < length; i++) {
+      if ((payload[at + i] & 0xFF) > 0x7F) {
+        throw malformed(lsn, "a name is 7-bit ASCII and byte " + i + " is not");
+      }
+    }
+    return new String(payload, at, length, StandardCharsets.US_ASCII);
   }
 
   /** Decodes the payload of a record the caller has already framed. */

@@ -24,7 +24,7 @@ import java.security.NoSuchAlgorithmException;
  * without holding it in memory. That is the {@code walDigest} — a checkpoint's claim about the
  * exact bytes of the log it covers (ADR 0004 §5).
  */
-final class Sha256 {
+public final class Sha256 {
 
   /** Chunk size for hashing a file prefix. Big enough to matter, small enough to be a loser. */
   private static final int CHUNK_BYTES = 64 * 1024;
@@ -41,7 +41,7 @@ final class Sha256 {
   }
 
   /** The digest of these bytes. */
-  static byte[] of(byte[] bytes) {
+  public static byte[] of(byte[] bytes) {
     return newDigest().digest(bytes);
   }
 

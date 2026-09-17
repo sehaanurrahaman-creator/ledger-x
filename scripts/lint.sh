@@ -13,9 +13,14 @@
 #      thread to its carrier. Per-account ordering uses ReentrantLock.
 #   7. no floating point in src/main/java/dev/ledgerx/domain/ — ADR 0002: money is integer
 #      minor units, and a `double` in the domain is a rounding error about somebody's money.
+#   8. the wall clock is read in exactly one file: IdempotencyPolicy.java — ADR 0005: a key
+#      binding's capture instant comes from the injected clock, so a replay's idea of "how old
+#      is this key" is a decision the ledger can be handed rather than one it takes in
+#      secret. System.nanoTime() is allowed anywhere: it is a monotonic deadline, not a
+#      reading of what day it is, and group commit's delay budget is nobody's idempotency.
 #
-# Rules 6 and 7 are the two ADRs enforced mechanically rather than in review, and a rule that
-# never fires is indistinguishable from a rule that is never violated — so both patterns run
+# Rules 6, 7 and 8 are the ADRs enforced mechanically rather than in review, and a rule that
+# never fires is indistinguishable from a rule that is never violated — so each pattern runs
 # against lines that must match and lines that must not, every time this script runs. That is
 # selftest(), below; it is not optional and it is not decoration.
 #
@@ -34,6 +39,13 @@ readonly COMMENT_LINE='^[[:space:]]*(\*|//|/\*)'
 
 # Rule 6: the keyword, not a substring of something else.
 readonly SYNCHRONIZED='(^|[^A-Za-z_])synchronized([^A-Za-z_]|$)'
+
+# Rule 8: every way of asking what time it is on the wall, as code shapes. The one file with
+# permission to match is excluded in the loop below, not by the pattern.
+readonly CLOCK_NOW='Instant\.now\(|Local(Date|Time)\.now\(|(Zoned|Offset)DateTime\.now\('
+readonly CLOCK_YEAR='Year(Month)?\.now\('
+readonly CLOCK_READ='System\.currentTimeMillis|Clock\.system[A-Za-z]*\('
+readonly WALL_CLOCK="${CLOCK_NOW}|${CLOCK_YEAR}|${CLOCK_READ}"
 
 # Rule 7, in four pieces, each one a code shape rather than a word.
 readonly FLOAT_DECL='(^|[^A-Za-z_."])(float|double)[[:space:]]+[A-Za-z_(]'
@@ -122,6 +134,21 @@ selftest() {
     matches "${tmp}/Sync.java" "${SYNCHRONIZED}" | sed 's/^/         matched /' >&2
   fi
 
+  printf '%s\n' \
+    'Instant captured = Instant.now();' \
+    'long at = System.currentTimeMillis();' \
+    'Clock clock = Clock.systemUTC();' \
+    'Clock zoned = Clock.systemDefaultZone();' \
+    'java.time.LocalDate today = LocalDate.now();' \
+    '* <p>Prose may say {@code Instant.now()} — comments are skipped, and prose is not' \
+    ' * <p>a hidden reading of the wall clock.</p>' \
+    > "${tmp}/Clock.java"
+  hits="$(matches "${tmp}/Clock.java" "${WALL_CLOCK}" | grep -c . || true)"
+  if [ "${hits}" -ne 5 ]; then
+    fail "selftest: the wall-clock rule matched ${hits} of the 5 violations it must match"
+    matches "${tmp}/Clock.java" "${WALL_CLOCK}" | sed 's/^/         matched /' >&2
+  fi
+
   rm -rf "${tmp}"
 }
 
@@ -200,10 +227,24 @@ for f in "${FILES[@]}"; do
       fi
       ;;
   esac
+
+  case "${f}" in
+    src/main/java/dev/ledgerx/idempotency/IdempotencyPolicy.java)
+      # The one file with permission: the default policy is where the wall clock is read, and
+      # the lint exists to keep it the only place.
+      ;;
+    src/main/java/*.java)
+      found="$(matches "${f}" "${WALL_CLOCK}")"
+      if [ -n "${found}" ]; then
+        fail "${f}: reads the wall clock (ADR 0005 — inject it, don't read it)"
+        printf '%s\n' "${found}" | sed 's/^/         /' >&2
+      fi
+      ;;
+  esac
 done
 
 if [ "${status}" -ne 0 ]; then
   exit "${status}"
 fi
 
-echo "lint: ${#FILES[@]} file(s) clean, rules 6 and 7 self-tested"
+echo "lint: ${#FILES[@]} file(s) clean, rules 6, 7 and 8 self-tested"
