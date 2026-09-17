@@ -12,13 +12,21 @@ import java.util.Set;
 
 /**
  * The whole ledger, in memory: one append-only event log, an index of balances derived from
- * it, and the validation that decides what may be appended.
+ * it, an index of idempotency bindings derived from it the same way, and the validation that
+ * decides what may be appended.
  *
  * <p>This is the prototype the domain ticket asks for, and it is deliberately the only thing
  * it is. There is no durability here, no WAL, no fsync, no clock and no lock. What it exists
  * to prove is that the grammar and the invariants are right before anything is built on top
  * of them: every downstream ticket — the record format, idempotency, replay, concurrency —
  * reads a decision made here.
+ *
+ * <p><strong>The idempotency index joined the balances in ADR 0005, under the rules ADR 0004
+ * §9 handed over.</strong> It is derived state — a fold of the log's keyed-posting events,
+ * checked against them by {@link #audit()} — and it holds <em>instants as data, never clock
+ * reads</em>: the capture instant of a binding is a value the caller supplies and the log
+ * committed, which is what lets replay be deterministic while expiry still has a wall clock to
+ * consult above this layer.
  *
  * <p><strong>Not thread-safe, and that is a decision.</strong> Concurrency is another
  * ticket's, and it has a hard constraint this class must not quietly violate: per-account
@@ -65,6 +73,39 @@ public final class InMemoryLedger {
    * its keep here: the alternative was a free-standing {@code int} that no other structure held to.
    */
   private final Set<AccountId> restored = new LinkedHashSet<>();
+
+  /**
+   * The idempotency index: one row per bound {@code (merchant, key)}, in binding order — which is
+   * log order, because a {@code LinkedHashMap} built by a fold holds rows in the order their
+   * records appear, and the order is the one the canonical state section requires (ADR 0005 §6).
+   *
+   * <p>Derived from the log and checked against it by {@link #audit()}, exactly like the balance
+   * index: a binding the index holds that neither the log bound nor a checkpoint restored was
+   * invented, and one the log binds that the index does not hold was lost. The one field that is
+   * <em>not</em> held to the log is the stored response — a reference to a transaction the event
+   * list already holds, a cache like any index, and re-materializable from the record the row's
+   * {@code responseLsn} names.
+   */
+  private final LinkedHashMap<Scope, Row> keyBindings = new LinkedHashMap<>();
+
+  /**
+   * The bindings that came from a checkpoint rather than from an event in this ledger's journal —
+   * the same partition the account index needs, for the same reason: a restored ledger's audit
+   * must be able to say "the index is the restored base plus what this journal bound", not merely
+   * count rows.
+   */
+  private final Set<Scope> restoredBindings = new LinkedHashSet<>();
+
+  /** The identity a binding is filed under: the pair the charter scopes by, nothing else. */
+  private record Scope(MerchantId merchant, IdempotencyKey key) {}
+
+  /**
+   * One row of the index: the durable binding, the committed capture instant, and the stored
+   * response. Immutable, like everything else in the index — recovery builds rows whole, from a
+   * checkpoint's identity, its timing section and the record the binding names, and never has to
+   * repair one half of a row it already inserted.
+   */
+  private record Row(KeyBinding binding, long capturedAtMillis, Transaction response) {}
 
   /**
    * Opens an account. Appends an event and moves no money, so it cannot disturb Σ balances.
@@ -150,6 +191,135 @@ public final class InMemoryLedger {
     Objects.requireNonNull(candidate, "candidate transaction");
     apply(candidate, validate(candidate));
     return candidate;
+  }
+
+  /**
+   * The check half of {@link #post}, and nothing else: every rule, against immutable state, with
+   * no append and no mutation.
+   *
+   * <p>This is the split ADR 0003 §9 asked the domain for and handed to a later ticket, and
+   * ADR 0005 §4 finally needs it: a keyed posting must sequence its append <em>between</em> the
+   * check and the apply, because the binding row names the LSN of the record that carries it — a
+   * number that does not exist until the append is acknowledged. A caller that checks first,
+   * appends second and applies third can give the row a true position; a caller that had to apply
+   * first would have to predict one.
+   *
+   * @throws RejectedTransactionException exactly as {@link #post} does, with nothing changed
+   */
+  public void check(Transaction candidate) {
+    Objects.requireNonNull(candidate, "candidate transaction");
+    validate(candidate);
+  }
+
+  /**
+   * Appends {@code candidate} <em>and binds the key to it</em>: one event, one row, one thing
+   * that either happened or did not.
+   *
+   * <p>This is the fold-side twin of {@code DurableLedger.postIdempotent}. The caller owns the
+   * log, so the caller supplies the position: on the write path it is the ack's LSN, on the
+   * replay path the record's own LSN, and the row is the same either way. Validation is the
+   * same {@link #validate} as {@link #post} runs — re-checked here rather than trusted from the
+   * write path, because a fold must be able to refuse a posting the domain rejects no matter who
+   * wrote it (ADR 0003 §4's {@code DOMAIN_REJECTED} rule, inherited).
+   *
+   * <p>Refusing a duplicate binding with {@link IllegalArgumentException} rather than returning a
+   * verdict is the same choice {@link #openAccount} makes, and for the same reason: no writer that
+   * consults the index before binding can produce a second binding for one pair, so a log that
+   * holds one was not written by this build, and recovery's job is to say so, loudly
+   * ({@code Replay} turns this into a refusal to open).
+   *
+   * @param merchant the scope the key is unique within
+   * @param key the client's key
+   * @param fingerprint the body the key is being bound to, as computed by the caller's codec
+   * @param capturedAtMillis the server's capture instant, committed verbatim
+   * @param responseLsn the LSN of the record carrying this posting, supplied by the log's owner
+   * @return the appended transaction — the same object, which is also the stored response
+   * @throws RejectedTransactionException if the candidate breaks the grammar, with nothing
+   *     appended, no row inserted, and no balance moved
+   * @throws IllegalArgumentException if {@code (merchant, key)} is already bound
+   */
+  public Transaction postIdempotently(
+      MerchantId merchant,
+      IdempotencyKey key,
+      RequestFingerprint fingerprint,
+      long capturedAtMillis,
+      long responseLsn,
+      Transaction candidate) {
+    Objects.requireNonNull(merchant, "merchant");
+    Objects.requireNonNull(key, "idempotency key");
+    Objects.requireNonNull(fingerprint, "request fingerprint");
+    Objects.requireNonNull(candidate, "candidate transaction");
+    Scope scope = new Scope(merchant, key);
+    if (keyBindings.containsKey(scope)) {
+      throw new IllegalArgumentException(
+          "the key " + key + " is already bound in the scope of " + merchant);
+    }
+    Map<AccountId, Long> checkedDeltas = validate(candidate);
+    events.add(
+        new JournalEvent.PostedIdempotently(
+            merchant, key, fingerprint, capturedAtMillis, candidate));
+    applyDeltas(checkedDeltas);
+    keyBindings.put(
+        scope,
+        new Row(new KeyBinding(merchant, key, fingerprint, responseLsn), capturedAtMillis,
+            candidate));
+    return candidate;
+  }
+
+  /**
+   * Restores a binding as a checkpoint recorded it: known, ordered, holding an identity whose
+   * response the caller re-read from the log the checkpoint points at.
+   *
+   * <p>Recovery's write path into the idempotency index, and the twin of {@link #restore}: the
+   * event exists — in the log, before the checkpoint's watermark — and the checkpoint's whole
+   * job
+   * is to stand in for the part of the journal this ledger is not going to hold. The caller
+   * supplies the capture instant from the checkpoint's timing section and the response from the
+   * record the binding names, because both live outside the hashed state section that is this
+   * method's primary input (ADR 0005 §6).
+   *
+   * @throws IllegalArgumentException if the pair is already bound — a log that re-binds a key a
+   *     checkpoint already restored is a refusal at replay, not a silent overwrite
+   */
+  public void restoreBinding(KeyBinding binding, long capturedAtMillis, Transaction response) {
+    Objects.requireNonNull(binding, "restored binding");
+    Objects.requireNonNull(response, "restored response");
+    Scope scope = new Scope(binding.merchant(), binding.key());
+    if (keyBindings.containsKey(scope)) {
+      throw new IllegalArgumentException("already bound: " + binding);
+    }
+    keyBindings.put(scope, new Row(binding, capturedAtMillis, response));
+    restoredBindings.add(scope);
+  }
+
+  /**
+   * What a lookup of {@code (merchant, key)} found, or {@code null} when nothing is bound.
+   *
+   * <p>One read returns every fact the decision needs — identity, capture instant, stored
+   * response — because the decision and the data it was made from must be one observation: a
+   * second lookup could race a commit and answer about a different instant than the first.
+   */
+  public BoundKey boundKey(MerchantId merchant, IdempotencyKey key) {
+    Objects.requireNonNull(merchant, "merchant");
+    Objects.requireNonNull(key, "idempotency key");
+    Row row = keyBindings.get(new Scope(merchant, key));
+    return row == null
+        ? null
+        : new BoundKey(row.binding(), row.capturedAtMillis(), row.response());
+  }
+
+  /** The bindings in log order — the order their records appear — for the canonical state. */
+  public List<KeyBinding> bindings() {
+    List<KeyBinding> snapshot = new ArrayList<>(keyBindings.size());
+    for (Row row : keyBindings.values()) {
+      snapshot.add(row.binding());
+    }
+    return List.copyOf(snapshot);
+  }
+
+  /** How many keys are bound, restored rows included. */
+  public int bindingCount() {
+    return keyBindings.size();
   }
 
   /**
@@ -249,6 +419,14 @@ public final class InMemoryLedger {
     // index of it; were this method able to fail halfway — it cannot — an event without its
     // index update is what audit() would report, which is the recoverable direction.
     events.add(new JournalEvent.Posted(accepted));
+    applyDeltas(checkedDeltas);
+  }
+
+  /**
+   * The balance half of an apply, shared by the plain and the keyed posting: one checked
+   * addition per touched account, in the account order the candidate named them in.
+   */
+  private void applyDeltas(Map<AccountId, Long> checkedDeltas) {
     for (Map.Entry<AccountId, Long> row : checkedDeltas.entrySet()) {
       balances.put(row.getKey(), Math.addExact(balances.get(row.getKey()), row.getValue()));
     }
@@ -336,13 +514,9 @@ public final class InMemoryLedger {
       if (event instanceof JournalEvent.AccountOpened opened) {
         folded.putIfAbsent(opened.account().id(), BigInteger.ZERO);
       } else if (event instanceof JournalEvent.Posted posted) {
-        for (Entry entry : posted.transaction().entries()) {
-          BigInteger signed = BigInteger.valueOf(entry.amount().minorUnits());
-          if (entry.side() == Side.CREDIT) {
-            signed = signed.negate();
-          }
-          folded.merge(entry.account(), signed, BigInteger::add);
-        }
+        foldEntries(folded, posted.transaction());
+      } else if (event instanceof JournalEvent.PostedIdempotently keyed) {
+        foldEntries(folded, keyed.transaction());
       }
     }
     Map<AccountId, Money> result = new LinkedHashMap<>();
@@ -352,17 +526,34 @@ public final class InMemoryLedger {
     return Collections.unmodifiableMap(result);
   }
 
+  /** Folds one transaction's entries into a running {@code BigInteger} total, debit-positive. */
+  private static void foldEntries(Map<AccountId, BigInteger> folded, Transaction transaction) {
+    for (Entry entry : transaction.entries()) {
+      BigInteger signed = BigInteger.valueOf(entry.amount().minorUnits());
+      if (entry.side() == Side.CREDIT) {
+        signed = signed.negate();
+      }
+      folded.merge(entry.account(), signed, BigInteger::add);
+    }
+  }
+
   /** Every event so far, in order. Snapshot; mutating it throws. */
   public List<JournalEvent> events() {
     return List.copyOf(events);
   }
 
-  /** The posted transactions only, in order. Snapshot; mutating it throws. */
+  /**
+   * The posted transactions only, in order — keyed postings included, because a keyed posting is
+   * a posting: the money moved the same way, and a caller summing the journal must not have to
+   * know which kind of event moved it.
+   */
   public List<Transaction> transactions() {
     List<Transaction> posted = new ArrayList<>();
     for (JournalEvent event : events) {
       if (event instanceof JournalEvent.Posted append) {
         posted.add(append.transaction());
+      } else if (event instanceof JournalEvent.PostedIdempotently keyed) {
+        posted.add(keyed.transaction());
       }
     }
     return List.copyOf(posted);
@@ -392,6 +583,10 @@ public final class InMemoryLedger {
    */
   public void audit() {
     Map<AccountId, Account> openedByLog = new LinkedHashMap<>();
+    // Fingerprint rather than KeyBinding: an event does not know the LSN of its own record, so
+    // the identity the index is held to is (merchant, key, fingerprint) — the position is the
+    // log owner's to have supplied, and the restore path checks it separately.
+    Map<Scope, RequestFingerprint> boundByLog = new LinkedHashMap<>();
     int sequence = 0;
     for (JournalEvent event : events) {
       if (event instanceof JournalEvent.AccountOpened open) {
@@ -401,6 +596,14 @@ public final class InMemoryLedger {
         }
       } else if (event instanceof JournalEvent.Posted posted) {
         auditTransaction(sequence, posted.transaction());
+      } else if (event instanceof JournalEvent.PostedIdempotently keyed) {
+        auditTransaction(sequence, keyed.transaction());
+        Scope scope = new Scope(keyed.merchant(), keyed.key());
+        if (boundByLog.putIfAbsent(scope, keyed.fingerprint()) != null) {
+          throw new IllegalStateException(
+              "event " + sequence + " binds " + keyed.key() + " twice in the scope of "
+                  + keyed.merchant());
+        }
       }
       sequence++;
     }
@@ -449,6 +652,49 @@ public final class InMemoryLedger {
               + indexed
               + " fold="
               + folded);
+    }
+
+    // The binding index is the restored base plus what the log bound, and nothing else — the
+    // same partition the account index is held to, with the same three failures: a row nobody
+    // wrote was invented, a binding the log made was lost, and a binding that came from a
+    // checkpoint is re-made by the log. The identity compared is (merchant, key, fingerprint):
+    // a row that names a different body for its key than the event does is exactly the bug the
+    // 409 exists to catch, found by the auditor instead of by a client.
+    if (keyBindings.size() != boundByLog.size() + restoredBindings.size()) {
+      throw new IllegalStateException(
+          "binding index disagrees with the log: the index holds "
+              + keyBindings.size()
+              + " bindings, the log binds "
+              + boundByLog.size()
+              + " and "
+              + restoredBindings.size()
+              + " were restored from a checkpoint");
+    }
+    for (Map.Entry<Scope, RequestFingerprint> bound : boundByLog.entrySet()) {
+      if (restoredBindings.contains(bound.getKey())) {
+        throw new IllegalStateException(
+            "binding index disagrees with the log: "
+                + bound.getKey().key()
+                + " came from a checkpoint and is bound again by the log");
+      }
+      Row row = keyBindings.get(bound.getKey());
+      if (!row.binding().fingerprint().equals(bound.getValue())) {
+        throw new IllegalStateException(
+            "binding index disagrees with the log on "
+                + bound.getKey().key()
+                + ": index="
+                + row.binding().fingerprint()
+                + " log="
+                + bound.getValue());
+      }
+    }
+    for (Scope fromCheckpoint : restoredBindings) {
+      if (boundByLog.containsKey(fromCheckpoint)) {
+        throw new IllegalStateException(
+            "binding index disagrees with the log: "
+                + fromCheckpoint.key()
+                + " is both restored and bound by this journal");
+      }
     }
 
     Money total = totalBalance();

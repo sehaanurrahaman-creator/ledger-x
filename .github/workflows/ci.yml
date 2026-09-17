@@ -27,8 +27,9 @@ jobs:
           java-version: '21'
 
       # One command, and it decides the verdict: the style lint (including the self-test of its
-      # own two ADR rules), javac --release 21 -Xlint:all -Werror, the substrate contract test
-      # and the domain model's property suite. It publishes both verdicts as run annotations.
+      # own three ADR rules), javac --release 21 -Xlint:all -Werror, the four contracts —
+      # substrate, durable-write, checkpoint, idempotency — and both property suites. It
+      # publishes every verdict as run annotations.
       - name: Build and test
         run: ./build.sh
 
@@ -50,7 +51,8 @@ jobs:
       - name: Checkpoint boundary harness
         run: make boundary
 
-      # The same properties at ~10x the operations, ~20s. Timing data for the map's CI-budget
-      # fog: this step is the expensive one and it is still cheap.
+      # The same properties at ~10x the operations, ~30s — the domain suite in memory and the
+      # idempotency suite against durable ledgers. Timing data for the map's CI-budget fog:
+      # this step is the expensive one and it is still cheap.
       - name: Extended property campaign
         run: make campaign

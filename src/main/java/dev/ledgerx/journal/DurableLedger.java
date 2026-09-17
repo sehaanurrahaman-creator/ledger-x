@@ -8,18 +8,30 @@ import dev.ledgerx.checkpoint.LedgerState;
 import dev.ledgerx.domain.Account;
 import dev.ledgerx.domain.AccountId;
 import dev.ledgerx.domain.AccountKind;
+import dev.ledgerx.domain.BoundKey;
+import dev.ledgerx.domain.IdempotencyKey;
 import dev.ledgerx.domain.InMemoryLedger;
 import dev.ledgerx.domain.JournalEvent;
+import dev.ledgerx.domain.KeyBinding;
+import dev.ledgerx.domain.MerchantId;
 import dev.ledgerx.domain.Money;
+import dev.ledgerx.domain.RequestFingerprint;
 import dev.ledgerx.domain.Transaction;
+import dev.ledgerx.idempotency.IdempotentReceipt;
+import dev.ledgerx.idempotency.IdempotencyConflictException;
+import dev.ledgerx.idempotency.IdempotencyExpiredException;
+import dev.ledgerx.idempotency.IdempotencyPolicy;
+import dev.ledgerx.wal.Corruption;
 import dev.ledgerx.wal.FsyncPolicy;
 import dev.ledgerx.wal.RecordType;
+import dev.ledgerx.wal.UnrecoverableLogException;
 import dev.ledgerx.wal.Wal;
 import dev.ledgerx.wal.WalFormat;
 import dev.ledgerx.wal.WalRecovery;
 import dev.ledgerx.wal.WalRecord;
 import java.io.IOException;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.locks.ReentrantLock;
@@ -75,6 +87,7 @@ public final class DurableLedger implements AutoCloseable {
   private final WalRecovery.Report recovery;
   private final CheckpointStore checkpointStore;
   private final CheckpointPolicy checkpointPolicy;
+  private final IdempotencyPolicy idempotency;
   private final CheckpointStore.Load checkpointLoad;
   private final int replayedRecords;
   private final ReentrantLock commitLock = new ReentrantLock();
@@ -100,6 +113,7 @@ public final class DurableLedger implements AutoCloseable {
       WalRecovery.Report recovery,
       CheckpointStore checkpointStore,
       CheckpointPolicy checkpointPolicy,
+      IdempotencyPolicy idempotency,
       CheckpointStore.Load checkpointLoad,
       int replayedRecords,
       long lastJournalLsn,
@@ -109,6 +123,7 @@ public final class DurableLedger implements AutoCloseable {
     this.recovery = recovery;
     this.checkpointStore = checkpointStore;
     this.checkpointPolicy = checkpointPolicy;
+    this.idempotency = idempotency;
     this.checkpointLoad = checkpointLoad;
     this.replayedRecords = replayedRecords;
     this.lastJournalLsn = lastJournalLsn;
@@ -124,7 +139,7 @@ public final class DurableLedger implements AutoCloseable {
    * how it says "only when I ask".
    */
   public static DurableLedger open(Path directory, FsyncPolicy policy) throws IOException {
-    return open(directory, policy, true, CheckpointPolicy.DEFAULT);
+    return open(directory, policy, true, CheckpointPolicy.DEFAULT, IdempotencyPolicy.system());
   }
 
   /**
@@ -133,15 +148,42 @@ public final class DurableLedger implements AutoCloseable {
    */
   public static DurableLedger open(Path directory, FsyncPolicy policy, boolean repair)
       throws IOException {
-    return open(directory, policy, repair, CheckpointPolicy.DEFAULT);
+    return open(directory, policy, repair, CheckpointPolicy.DEFAULT, IdempotencyPolicy.system());
   }
 
-  /** The full open: the fsync policy, recovery's repair switch, and the checkpoint cadence. */
+  /**
+   * The same, with the checkpoint cadence exposed and idempotency at its production default.
+   */
   public static DurableLedger open(
       Path directory, FsyncPolicy policy, boolean repair, CheckpointPolicy checkpoints)
       throws IOException {
+    return open(directory, policy, repair, checkpoints, IdempotencyPolicy.system());
+  }
+
+  /**
+   * The full open: the fsync policy, recovery's repair switch, the checkpoint cadence, and the
+   * idempotency policy — which clock to consult, and how long a stored response is replayed
+   * before it is refused.
+   *
+   * <p><strong>Bindings are seeded in three moves.</strong> A usable checkpoint's state section
+   * holds the identity rows; its timing section holds their capture instants; and each row's
+   * {@code responseLsn} names the record that carries the stored response, which is re-read from
+   * the log rather than duplicated into the checkpoint — the log is the history, the checkpoint
+   * is a cache, and a response the log still holds is never copied beside it (ADR 0005 §6). The
+   * tail is folded afterwards, exactly as before: a keyed record above the watermark binds through
+   * the fold, and a duplicate across the two would be a log this build did not write, which the
+   * fold refuses.
+   */
+  public static DurableLedger open(
+      Path directory,
+      FsyncPolicy policy,
+      boolean repair,
+      CheckpointPolicy checkpoints,
+      IdempotencyPolicy idempotency)
+      throws IOException {
     Objects.requireNonNull(directory, "ledger directory");
     Objects.requireNonNull(checkpoints, "checkpoint policy");
+    Objects.requireNonNull(idempotency, "idempotency policy");
     Wal wal = Wal.open(directory.resolve(Wal.FILE_NAME), policy, repair);
     CheckpointStore store = new CheckpointStore(directory);
     CheckpointStore.Load load;
@@ -150,8 +192,16 @@ public final class DurableLedger implements AutoCloseable {
     try {
       load = store.load(wal.file(), wal.recovered());
       if (load.used()) {
-        replayed = load.checkpoint().state().restore();
-        tail = Replay.foldAfter(load.checkpoint().lastLsn(), wal.recovered(), replayed);
+        Checkpoint checkpoint = load.checkpoint();
+        replayed = checkpoint.state().restore();
+        List<KeyBinding> bindings = checkpoint.state().bindings();
+        List<Long> instants = checkpoint.captureInstants();
+        for (int i = 0; i < bindings.size(); i++) {
+          KeyBinding binding = bindings.get(i);
+          replayed.restoreBinding(
+              binding, instants.get(i), storedResponse(wal.recovered(), binding.responseLsn()));
+        }
+        tail = Replay.foldAfter(checkpoint.lastLsn(), wal.recovered(), replayed);
       } else {
         replayed = Replay.fold(wal.recovered());
         tail = replayed.size();
@@ -164,7 +214,55 @@ public final class DurableLedger implements AutoCloseable {
     long lastEnd =
         lastLsn == 0L ? WalFormat.SEGMENT_HEADER_BYTES : wal.recovered().endOf(lastLsn);
     return new DurableLedger(
-        wal, replayed, wal.recovery(), store, checkpoints, load, tail, lastLsn, lastEnd);
+        wal, replayed, wal.recovery(), store, checkpoints, idempotency, load, tail, lastLsn,
+        lastEnd);
+  }
+
+  /**
+   * The stored response of a binding, re-read from the record that made it — dense LSNs make the
+   * record list an array indexed by position, which is the one place this repository gets random
+   * access for free.
+   *
+   * <p>Every claim is checked, not assumed: the record at that index must carry exactly that LSN
+   * and be an {@code IDEMPOTENT_POSTING}, or the checkpoint and the log disagree about which
+   * record made a binding — a disagreement that cannot come from a crash, only from damage, and
+   * damage is refused rather than folded around ({@code DOMAIN_REJECTED}, the same refusal the
+   * replay itself would make).
+   */
+  private static Transaction storedResponse(WalRecovery.Scan scan, long responseLsn)
+      throws IOException {
+    List<WalRecord> records = scan.records();
+    if (responseLsn < 1L || responseLsn > records.size()) {
+      throw new UnrecoverableLogException(
+          Corruption.DOMAIN_REJECTED,
+          -1L,
+          null,
+          "a binding names lsn " + responseLsn + " and the clean prefix holds "
+              + records.size() + " records",
+          null);
+    }
+    WalRecord record = records.get((int) (responseLsn - 1L));
+    if (record.lsn().value() != responseLsn || record.type() != RecordType.IDEMPOTENT_POSTING) {
+      throw new UnrecoverableLogException(
+          Corruption.DOMAIN_REJECTED,
+          -1L,
+          record.lsn(),
+          "a binding names lsn " + responseLsn + " as its keyed posting, and the record there"
+              + " is a " + record.type() + " at lsn " + record.lsn().value(),
+          null);
+    }
+    try {
+      JournalEvent event =
+          EventCodec.decode(record.type(), record.payloadUnsafe(), record.lsn().value());
+      return ((JournalEvent.PostedIdempotently) event).transaction();
+    } catch (IOException malformed) {
+      throw new UnrecoverableLogException(
+          Corruption.DOMAIN_REJECTED,
+          -1L,
+          record.lsn(),
+          "the stored response at lsn " + responseLsn + " does not decode: " + malformed,
+          malformed);
+    }
   }
 
   /**
@@ -232,6 +330,119 @@ public final class DurableLedger implements AutoCloseable {
   }
 
   /**
+   * Posts a transaction under an idempotency key: the whole of the charter's key contract, in one
+   * critical section. ADR 0005 §2, as code.
+   *
+   * <p>The decision tree, in the order it is evaluated — an order the ADR fixes, because each
+   * branch's outcome must not depend on the ones below it:
+   *
+   * <ol>
+   *   <li><strong>Unbound key:</strong> check the candidate against the domain, commit one record
+   *       carrying both the key material and the entries (one append, one force, one ack), apply
+   *       it, and return the receipt with {@code replayed = false}. A refused candidate leaves no
+   *       trace — nothing appended, no binding, the key still usable.
+   *   <li><strong>Bound, different body:</strong> {@link IdempotencyConflictException} — the 409,
+   *       unconditionally, at any age, with nothing changed. This is checked before expiry on
+   *       purpose: a client bug is louder than an old response, and the louder finding is the one
+   *       a caller must see.
+   *   <li><strong>Bound, same body, within retention:</strong> the stored response, with
+   *       {@code replayed = true} and the original's LSN — no append, no money movement, no state
+   *       change at all.
+   *   <li><strong>Bound, same body, past retention:</strong>
+   *       {@link IdempotencyExpiredException} — refused, never replayed, never re-executed.
+   * </ol>
+   *
+   * <p><strong>The ordering inside the critical section is the atomicity argument.</strong> The
+   * binding check, the body check, the capture instant and the append all happen under the one
+   * lock, so a duplicate — concurrent or retried — observes either "unbound" or "bound", never
+   * "half-bound": there is no in-flight state to be in, which is why ledger-x's 409 means exactly
+   * one thing (different body) and never Stripe's "in-flight, retry me". A hundred concurrent
+   * retries of one key serialize here; one binds, ninety-nine replay, none re-post — the
+   * duplicate
+   * storm, by construction rather than by lock contention.
+   *
+   * <p><strong>This path applies after the ack</strong>, where {@link #post} applies before the
+   * append: the binding row names the LSN of its own record, a number that exists only once the
+   * append is acknowledged, and ADR 0003 §9's asked-for validate/apply split is what makes the
+   * sequencing legal ({@link InMemoryLedger#check} then {@link InMemoryLedger#postIdempotently}).
+   * A failure to apply after a successful ack is terminal for this instance — the log would hold
+   * money memory has not — and is marked exactly like a storage failure.
+   *
+   * @throws IdempotencyConflictException same key, different body — at any age, nothing changed
+   * @throws IdempotencyExpiredException same key and body, past retention — refused, nothing
+   *     changed
+   * @throws dev.ledgerx.domain.RejectedTransactionException an unbound key whose candidate breaks
+   *     the grammar, with nothing appended and no binding made
+   */
+  public IdempotentReceipt postIdempotent(
+      MerchantId merchant, IdempotencyKey key, Transaction candidate) throws IOException {
+    return postIdempotent(merchant, key, candidate, wal.policy());
+  }
+
+  /** The same, under an explicit fsync policy — a payout intent demanding its own force. */
+  public IdempotentReceipt postIdempotent(
+      MerchantId merchant, IdempotencyKey key, Transaction candidate, FsyncPolicy policy)
+      throws IOException {
+    Objects.requireNonNull(merchant, "merchant");
+    Objects.requireNonNull(key, "idempotency key");
+    Objects.requireNonNull(candidate, "candidate transaction");
+    Objects.requireNonNull(policy, "fsync policy");
+    commitLock.lock();
+    try {
+      requireHealthy();
+      long now = idempotency.clock().millis();
+      BoundKey bound = ledger.boundKey(merchant, key);
+      if (bound != null) {
+        RequestFingerprint presented = EventCodec.fingerprintOf(candidate);
+        if (!presented.equals(bound.binding().fingerprint())) {
+          throw new IdempotencyConflictException(
+              merchant, key, bound.binding().fingerprint(), presented);
+        }
+        if (now - bound.capturedAtMillis() < idempotency.retentionMillis()) {
+          return new IdempotentReceipt(
+              merchant,
+              key,
+              bound.response(),
+              true,
+              bound.binding().responseLsn(),
+              bound.capturedAtMillis());
+        }
+        throw new IdempotencyExpiredException(
+            merchant, key, bound.capturedAtMillis(), idempotency.retentionMillis());
+      }
+      ledger.check(candidate);
+      RequestFingerprint fingerprint = EventCodec.fingerprintOf(candidate);
+      long capturedAt = now;
+      JournalEvent event =
+          new JournalEvent.PostedIdempotently(merchant, key, fingerprint, capturedAt, candidate);
+      Wal.Ack acked = ack(EventCodec.typeOf(event), EventCodec.encode(event), policy);
+      try {
+        ledger.postIdempotently(
+            merchant, key, fingerprint, capturedAt, acked.lsn().value(), candidate);
+      } catch (RuntimeException applyBroke) {
+        // The record is durable and memory does not have it: the one state this class cannot
+        // serve from, and the reason the instance stops here rather than hoping the next
+        // operation repairs what it cannot.
+        failure =
+            new IOException(
+                "the keyed posting at lsn " + acked.lsn().value()
+                    + " was acknowledged but could not be applied; this instance will not"
+                    + " serve a memory the log disagrees with — reopen and replay",
+                applyBroke);
+        throw applyBroke;
+      }
+      afterCommit();
+      return new IdempotentReceipt(
+          merchant, key, candidate, false, acked.lsn().value(), capturedAt);
+    } catch (IOException storageFailed) {
+      failure = storageFailed;
+      throw storageFailed;
+    } finally {
+      commitLock.unlock();
+    }
+  }
+
+  /**
    * Takes a checkpoint of the state as it stands: the state hash of a run, the number a crash's
    * recovery has to reproduce.
    *
@@ -258,8 +469,12 @@ public final class DurableLedger implements AutoCloseable {
     // already durable, and under NO_FSYNC this is the only force those bytes will ever get.
     wal.forceData();
     LedgerState state = LedgerState.of(ledger, lastJournalLsn);
+    List<Long> instants = new ArrayList<>(state.bindingCount());
+    for (KeyBinding binding : state.bindings()) {
+      instants.add(ledger.boundKey(binding.merchant(), binding.key()).capturedAtMillis());
+    }
     Checkpoint written =
-        Checkpoint.of(state, lastJournalEnd, wal.file());
+        Checkpoint.of(state, instants, lastJournalEnd, wal.file());
     checkpointStore.write(written, checkpointPolicy.retain(), checkpointListener);
     commitsSinceCheckpoint = 0;
     checkpointsWritten++;
@@ -376,13 +591,14 @@ public final class DurableLedger implements AutoCloseable {
     return wal.durableThrough();
   }
 
-  private void ack(RecordType type, byte[] payload, FsyncPolicy policy) throws IOException {
+  private Wal.Ack ack(RecordType type, byte[] payload, FsyncPolicy policy) throws IOException {
     Wal.Ack acked = wal.appendSync(type, payload, policy);
     lastAck = acked;
     if (type.isJournalEvent()) {
       lastJournalLsn = acked.lsn().value();
       lastJournalEnd = acked.end();
     }
+    return acked;
   }
 
   private void requireHealthy() {

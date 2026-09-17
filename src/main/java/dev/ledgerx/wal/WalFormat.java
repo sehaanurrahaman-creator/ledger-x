@@ -40,8 +40,21 @@ public final class WalFormat {
   /** "LWAL" — the file starts with something that cannot be money by accident. */
   public static final int SEGMENT_MAGIC = 0x4C57_414C;
 
-  /** The only format version this code writes, and the only one it reads. */
-  public static final byte FORMAT_VERSION = 1;
+  /**
+   * The segment version this code writes. Version 2 added the {@code IDEMPOTENT_POSTING} record
+   * type (ADR 0005 §4); the framing — header, frame layout, CRC scheme — is unchanged, so a
+   * version-2 reader accepts version-1 logs and refuses everything older or newer at the header,
+   * where the refusal is cheap.
+   */
+  public static final byte FORMAT_VERSION = 2;
+
+  /**
+   * The oldest segment version this code reads. Version 1 is every log written before
+   * idempotency existed: same framing, three record types, and a reader that meets an
+   * {@code IDEMPOTENT_POSTING} frame inside one must treat it as the unknown type it is —
+   * which the scan enforces rather than trusting the type byte alone.
+   */
+  public static final int OLDEST_READABLE_FORMAT_VERSION = 1;
 
   /** Fixed-size part of the segment header. The header is not truncatable: ADR 0003 §4. */
   public static final int SEGMENT_HEADER_BYTES = 16;

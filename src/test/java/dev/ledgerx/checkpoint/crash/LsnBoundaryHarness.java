@@ -7,10 +7,15 @@ import dev.ledgerx.checkpoint.LedgerState;
 import dev.ledgerx.domain.AccountId;
 import dev.ledgerx.domain.AccountKind;
 import dev.ledgerx.domain.Entry;
+import dev.ledgerx.domain.IdempotencyKey;
 import dev.ledgerx.domain.InMemoryLedger;
+import dev.ledgerx.domain.MerchantId;
 import dev.ledgerx.domain.Money;
 import dev.ledgerx.domain.Side;
 import dev.ledgerx.domain.Transaction;
+import dev.ledgerx.idempotency.IdempotencyConflictException;
+import dev.ledgerx.idempotency.IdempotentReceipt;
+import dev.ledgerx.idempotency.IdempotencyPolicy;
 import dev.ledgerx.journal.DurableLedger;
 import dev.ledgerx.journal.Replay;
 import dev.ledgerx.wal.FsyncPolicy;
@@ -97,12 +102,18 @@ public final class LsnBoundaryHarness {
     new Config("no fsync, a checkpoint every third commit", "no-fsync", "every:3:retain:3"),
   };
 
-  /** Where the stage sweep arms itself, as fractions of the history: early, middle, late. */
-  private static final double[] STAGE_ARMS = {0.0d, 0.5d, 0.9d};
+  /**
+   * How many of the golden run's own checkpoints the stage sweep kills inside, per stage: the
+   * first, the middle and the last. The arms are read from the golden run's {@code CKPT} lines
+   * rather than taken as fractions of the history, because a fraction can name an instant after
+   * the history's last checkpoint — an armed child that has nothing left to die inside.
+   */
+  private static final int STAGE_ARMS_PER_STAGE = 3;
 
   private final List<String> failures = new ArrayList<>();
   private long cycles;
   private long killed;
+  private long stageKills;
   private long recoveries;
   private long tailRecords;
   private long checkpointsUsed;
@@ -178,9 +189,9 @@ public final class LsnBoundaryHarness {
         }
         if (config.checkpointPolicy().automatic()) {
           for (CheckpointStage stage : CheckpointStage.values()) {
-            for (double fraction : STAGE_ARMS) {
-              int arm = (int) Math.round(fraction * ops);
+            for (int arm : golden.stageArms(STAGE_ARMS_PER_STAGE)) {
               cycles++;
+              stageKills++;
               List<String> problems = stage(config, golden, stage, arm, ops, seed);
               tally(problems, config, "killed at " + stage + " after " + arm + " operation(s)");
             }
@@ -376,7 +387,8 @@ public final class LsnBoundaryHarness {
     // the configuration's own cadence, so that a checkpoint written *after* a recovery is exercised
     // too — a checkpoint whose coverage starts at a log that already holds a recovery marker.
     try (DurableLedger resumed =
-        DurableLedger.open(dir, config.fsyncPolicy(), true, config.checkpointPolicy())) {
+        DurableLedger.open(
+            dir, config.fsyncPolicy(), true, config.checkpointPolicy(), policy())) {
       for (int op = boundary + 1; op <= ops; op++) {
         apply(resumed, golden.outcomes().get(op - 1));
         if (!golden.hashAt(op).equals(resumed.stateHash())) {
@@ -397,8 +409,41 @@ public final class LsnBoundaryHarness {
     return problems;
   }
 
+  /**
+   * The same frozen-clock policy the target runs under — the fold must answer a retry the way
+   * the child did, on any day the harness runs.
+   */
+  private static IdempotencyPolicy policy() {
+    return IdempotencyPolicy.of(
+        java.time.Clock.fixed(java.time.Instant.EPOCH, java.time.ZoneOffset.UTC),
+        java.time.Duration.ofHours(24));
+  }
+
   /** Applies one operation from the golden run's own record of it to a live ledger. */
   private static void apply(DurableLedger ledger, String outcome) throws IOException {
+    if (outcome.startsWith("R ")) {
+      // A replay: same scope, same body, and the ledger must agree it already answered.
+      String[] parts = outcome.split(" ", 5);
+      IdempotentReceipt receipt =
+          ledger.postIdempotent(
+              MerchantId.of(parts[1]), IdempotencyKey.of(parts[2]), transactionIn(parts[4]));
+      if (!receipt.replayed()) {
+        throw new IOException(
+            "a replayed outcome posted instead: " + outcome);
+      }
+      return;
+    }
+    if (outcome.startsWith("C ")) {
+      // A conflict: same scope, a different body, and the ledger must refuse it again.
+      String[] parts = outcome.split(" ", 4);
+      try {
+        ledger.postIdempotent(
+            MerchantId.of(parts[1]), IdempotencyKey.of(parts[2]), transactionIn(parts[3]));
+      } catch (IdempotencyConflictException conflict) {
+        return;
+      }
+      throw new IOException("a conflicted outcome was accepted instead: " + outcome);
+    }
     if (!outcome.startsWith("A ")) {
       // An "N" outcome: the golden run appended nothing, and so must this one.
       return;
@@ -414,21 +459,33 @@ public final class LsnBoundaryHarness {
       ledger.openAccount(AccountId.of(parts[1]), AccountKind.valueOf(parts[2]));
       return;
     }
+    if (op.startsWith("I ")) {
+      String[] parts = op.split(" ", 4);
+      ledger.postIdempotent(
+          MerchantId.of(parts[1]), IdempotencyKey.of(parts[2]), transactionIn(parts[3]));
+      return;
+    }
     if (!op.startsWith("P ")) {
       throw new IOException("an operation this harness does not know: " + outcome);
     }
-    String[] parts = op.split(" ");
-    int count = Integer.parseInt(parts[1]);
+    ledger.post(transactionIn(op.substring(2)));
+  }
+
+  /** {@code <n> acct:D:minor …} — the body every keyed verb carries, parsed into a
+   * transaction.  */
+  private static Transaction transactionIn(String body) {
+    String[] parts = body.split(" ");
+    int count = Integer.parseInt(parts[0]);
     List<Entry> entries = new ArrayList<>(count);
     for (int i = 0; i < count; i++) {
-      String[] row = parts[2 + i].split(":");
+      String[] row = parts[1 + i].split(":");
       entries.add(
           new Entry(
               AccountId.of(row[0]),
               row[1].equals("D") ? Side.DEBIT : Side.CREDIT,
               Money.ofMinor(Long.parseLong(row[2]))));
     }
-    ledger.post(new Transaction(entries));
+    return new Transaction(entries);
   }
 
   /** The crashed run's log must be a byte prefix of the uninterrupted run's log. */
@@ -534,13 +591,16 @@ public final class LsnBoundaryHarness {
       return acks;
     }
 
-    /** Every operation's outcome, in order: the {@code A}/{@code N} part of its line. */
+    /**
+     * Every operation's outcome, in order: the {@code A}/{@code N}/{@code R}/{@code C} part of
+     * its line. A retry and a conflict are outcomes the fold must apply too — they change
+     * nothing in the golden ledger, but proving that is the fold's job, not an assumption of it.
+     */
     List<String> outcomes() {
       List<String> outcomes = new ArrayList<>();
       for (String line : lines) {
-        if (line.startsWith("A ")) {
-          outcomes.add(line);
-        } else if (line.startsWith("N ")) {
+        if (line.startsWith("A ") || line.startsWith("N ") || line.startsWith("R ")
+            || line.startsWith("C ")) {
           outcomes.add(line);
         }
       }
@@ -551,6 +611,35 @@ public final class LsnBoundaryHarness {
     List<String> opPrefix(int count) {
       List<String> outcomes = outcomes();
       return outcomes.subList(0, Math.min(count, outcomes.size()));
+    }
+
+    /**
+     * Arm points for the stage sweep: the operation before each {@code CKPT} line, capped at
+     * {@code wanted} and spread first/middle/last. Arming after op {@code k - 1} makes the
+     * checkpoint that began during op {@code k} the one the child dies inside — the checkpoint
+     * is real, because the golden run took it, and it is after the arm, by construction.
+     */
+    List<Integer> stageArms(int wanted) {
+      List<Integer> checkpoints = new ArrayList<>();
+      for (String line : lines) {
+        if (line.startsWith("CKPT ")) {
+          checkpoints.add(Integer.parseInt(field(line, 1)));
+        }
+      }
+      if (checkpoints.isEmpty()) {
+        return List.of();
+      }
+      List<Integer> arms = new ArrayList<>(wanted);
+      for (int i = 0; i < wanted && i < checkpoints.size(); i++) {
+        int index = checkpoints.size() == 1
+            ? 0
+            : Math.round((checkpoints.size() - 1) * i / (float) (wanted - 1));
+        int arm = checkpoints.get(index) - 1;
+        if (arm >= 0 && !arms.contains(arm)) {
+          arms.add(arm);
+        }
+      }
+      return arms;
     }
 
     /** An {@code H} line reads {@code H <op> <hash> <lsn> <end>}, so the hash is field 2. */
@@ -626,8 +715,9 @@ public final class LsnBoundaryHarness {
     System.out.println();
     System.out.println("boundary harness: " + cycles + " cycles, " + killed + " SIGKILLs, "
         + recoveries + " recoveries");
-    System.out.println("  " + (ops + 1) + " prefixes per configuration, plus "
-        + CheckpointStage.values().length * STAGE_ARMS.length + " stage kills");
+    System.out.println(
+        "  " + (ops + 1) + " prefixes per configuration, plus " + stageKills
+            + " stage kills, armed on the golden run's own checkpoints");
     System.out.println("  recoveries folded " + tailRecords + " tail record(s) in total");
     System.out.println("  " + checkpointsUsed + " recoveries used a checkpoint");
     System.out.println("  " + millis + " ms");

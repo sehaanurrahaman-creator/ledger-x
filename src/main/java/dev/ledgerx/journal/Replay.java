@@ -130,6 +130,39 @@ public final class Replay {
       ledger.openAccount(opened.account().id(), opened.account().kind());
       return event;
     }
+    if (event instanceof JournalEvent.PostedIdempotently keyed) {
+      // The double-binding refusal, stated before the apply so the message can say what the log
+      // did rather than what the domain noticed: the commit path consults the index before it
+      // binds, so two records binding one (merchant, key) are not a race this build lost but a
+      // log it did not write — the exactly-once theorem's one way to be false, found at replay
+      // instead of at a client (ADR 0005 §7).
+      if (ledger.boundKey(keyed.merchant(), keyed.key()) != null) {
+        throw new UnrecoverableLogException(
+            Corruption.DOMAIN_REJECTED,
+            -1L,
+            record.lsn(),
+            "the log binds (" + keyed.merchant() + ", " + keyed.key() + ") twice, which no"
+                + " writer of this format can do, so the log is not what this build wrote",
+            null);
+      }
+      try {
+        ledger.postIdempotently(
+            keyed.merchant(),
+            keyed.key(),
+            keyed.fingerprint(),
+            keyed.capturedAtMillis(),
+            record.lsn().value(),
+            keyed.transaction());
+      } catch (RejectedTransactionException refused) {
+        throw new UnrecoverableLogException(
+            Corruption.DOMAIN_REJECTED,
+            -1L,
+            record.lsn(),
+            "a " + record.type() + " record the ledger refuses: " + refused.getMessage(),
+            refused);
+      }
+      return event;
+    }
     try {
       ledger.post(((JournalEvent.Posted) event).transaction());
     } catch (RejectedTransactionException refused) {

@@ -5,14 +5,17 @@ import dev.ledgerx.checkpoint.CheckpointPolicy;
 import dev.ledgerx.checkpoint.CheckpointStage;
 import dev.ledgerx.domain.AccountId;
 import dev.ledgerx.domain.Entry;
+import dev.ledgerx.domain.IdempotencyKey;
 import dev.ledgerx.domain.LedgerOp;
 import dev.ledgerx.domain.ModelLedger;
+import dev.ledgerx.domain.MerchantId;
 import dev.ledgerx.domain.Money;
 import dev.ledgerx.domain.OpEntry;
 import dev.ledgerx.domain.OpGenerator;
 import dev.ledgerx.domain.RejectedTransactionException;
 import dev.ledgerx.domain.Side;
 import dev.ledgerx.domain.Transaction;
+import dev.ledgerx.idempotency.IdempotencyPolicy;
 import dev.ledgerx.journal.DurableLedger;
 import dev.ledgerx.testing.RandomSource;
 import dev.ledgerx.wal.FsyncPolicy;
@@ -20,6 +23,10 @@ import dev.ledgerx.wal.Wal;
 import java.io.IOException;
 import java.io.PrintStream;
 import java.nio.charset.StandardCharsets;
+import java.time.Clock;
+import java.time.Duration;
+import java.time.Instant;
+import java.time.ZoneOffset;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -43,7 +50,12 @@ import java.util.List;
  * <pre>{@code
  * A <lsn> <end> <durableThrough> <forced> O acct-<n> <KIND>    an account was opened and acked
  * A <lsn> <end> <durableThrough> <forced> P <n> acct:D:minor …  a posting was acked
+ * A <lsn> <end> <durableThrough> <forced> I <m> <key> <n> …    a keyed posting was acked
+ * R <m> <key> <origLsn> <n> acct:D:minor …                     a retry replayed; nothing appended
+ * C <m> <key> <n> acct:D:minor …                          a reused key conflicted; nothing
+ *                                                              appended
  * N <why>                                                      nothing was appended
+ * CKPT <op>                                                    a checkpoint began during op <op>
  * H <op> <stateHash> <lastJournalLsn> <lastJournalEnd>         the live state after op <op>
  * LIVE <stateHash> <lastJournalLsn> <lastJournalEnd> <op>      printed, then the boundary crash
  * ARMED <stage>                                                a stage crash is armed
@@ -113,13 +125,15 @@ public final class LsnBoundaryTarget {
       throws IOException {
     List<LedgerOp> history = OpGenerator.sequence(new RandomSource(seed), ops);
     String tail;
-    try (DurableLedger ledger = DurableLedger.open(dir, fsync, true, checkpoints)) {
+    int[] currentOp = {0};
+    try (DurableLedger ledger = DurableLedger.open(dir, fsync, true, checkpoints, policy())) {
       StageKiller killer =
           new StageKiller(
               crash,
               out,
               () -> ledger.stateHash() + " " + ledger.lastJournalLsn() + " "
-                  + ledger.lastJournalEnd());
+                  + ledger.lastJournalEnd(),
+              () -> currentOp[0]);
       ledger.onCheckpointStage(killer);
       History applier = new History(ledger, out);
       report(out, ledger, 0);
@@ -133,8 +147,9 @@ public final class LsnBoundaryTarget {
         killer.arm();
       }
       for (int i = 0; i < history.size(); i++) {
-        applier.apply(history.get(i));
+        applier.apply(history.get(i), i);
         int op = i + 1;
+        currentOp[0] = op;
         report(out, ledger, op);
         if (crash.mode() == Crash.Mode.AFTER && crash.at() == op) {
           boundary(ledger, out, op);
@@ -154,7 +169,8 @@ public final class LsnBoundaryTarget {
     // the tail on the way out except this reopen's own force (ADR 0003 §4), so a golden run whose
     // "OK" line matched a state the log does not hold would be exactly the bug this harness hunts.
     try (DurableLedger reopened =
-        DurableLedger.open(dir, FsyncPolicy.PER_COMMIT, true, CheckpointPolicy.MANUAL)) {
+        DurableLedger.open(
+            dir, FsyncPolicy.PER_COMMIT, true, CheckpointPolicy.MANUAL, policy())) {
       String after = reopened.stateHash() + " " + reopened.lastJournalLsn() + " "
           + reopened.lastJournalEnd();
       if (!after.equals(tail)) {
@@ -163,6 +179,16 @@ public final class LsnBoundaryTarget {
       }
     }
     out.println("OK " + tail);
+  }
+
+  /**
+   * The idempotency policy every open in this target uses: a clock frozen at the epoch, so a
+   * binding's age is a property of the history — zero forever — and neither the child's runs
+   * nor the parent's folds can disagree about which replays replay.
+   */
+  private static IdempotencyPolicy policy() {
+    return IdempotencyPolicy.of(Clock.fixed(Instant.EPOCH, ZoneOffset.UTC),
+        Duration.ofHours(24));
   }
 
   private static void report(PrintStream out, DurableLedger ledger, int op) {
@@ -204,18 +230,21 @@ public final class LsnBoundaryTarget {
     Runtime.getRuntime().halt(137);
   }
 
-  /** Watches the swap's stages and dies inside one when armed. */
+  /** Watches the swap's stages, reports each checkpoint as it starts, and dies when armed. */
   private static final class StageKiller implements CheckpointListener {
 
     private final Crash crash;
     private final PrintStream out;
     private final StateTail state;
+    private final java.util.function.IntSupplier currentOp;
     private boolean armed;
 
-    StageKiller(Crash crash, PrintStream out, StateTail state) {
+    StageKiller(
+        Crash crash, PrintStream out, StateTail state, java.util.function.IntSupplier currentOp) {
       this.crash = crash;
       this.out = out;
       this.state = state;
+      this.currentOp = currentOp;
     }
 
     void arm() {
@@ -224,6 +253,13 @@ public final class LsnBoundaryTarget {
 
     @Override
     public void reached(CheckpointStage stage) {
+      if (stage == CheckpointStage.TEMP_WRITTEN) {
+        // The first stage of a swap, and therefore the line that tells the parent when this
+        // history takes checkpoints — the parent arms its stage crashes from these, so a
+        // checkpoint the history never reaches is never armed, and an armed crash always has
+        // a swap to die inside.
+        out.println("CKPT " + currentOp.getAsInt());
+      }
       if (!armed || stage != crash.stage()) {
         return;
       }
@@ -245,13 +281,15 @@ public final class LsnBoundaryTarget {
     private final ModelLedger model = new ModelLedger();
     private final PrintStream out;
     private int opened;
+    private KeyedBody lastKeyed;
+    private final List<String> schedule = new ArrayList<>();
 
     History(DurableLedger ledger, PrintStream out) {
       this.ledger = ledger;
       this.out = out;
     }
 
-    void apply(LedgerOp op) throws IOException {
+    void apply(LedgerOp op, int index) throws IOException {
       if (op instanceof LedgerOp.OpenAccount open) {
         AccountId id = AccountId.of("acct-" + opened);
         ledger.openAccount(id, open.kind());
@@ -271,7 +309,23 @@ public final class LsnBoundaryTarget {
         out.println("N " + expected.why());
         return;
       }
+      if (!schedule.isEmpty() && lastKeyed != null) {
+        // A keyed posting schedules its own aftermath: the next two posting ops re-send the
+        // body — once as the client meant it (a retry), once as a client bug (a mutation) —
+        // so every binding the history creates is also read back, on both sides of every
+        // boundary the parent crashes at, whatever the generator made of the slots between.
+        switch (schedule.remove(0)) {
+          case "R" -> retry();
+          case "C" -> mutatedReuse();
+          default -> throw new IllegalStateException("a verb this target does not know");
+        }
+        return;
+      }
       Transaction candidate = build(resolved);
+      if (index % 2 == 0) {
+        keyedPosting(index, candidate);
+        return;
+      }
       try {
         Transaction posted = ledger.post(candidate);
         model.commit(posted);
@@ -280,6 +334,80 @@ public final class LsnBoundaryTarget {
         out.println("N " + refused.reason());
       }
     }
+
+    /**
+     * The keyed act, interleaved with the plain history: every even op posts under a fresh key,
+     * and every keyed posting schedules its own aftermath — the next posting op re-sends the
+     * body as a retry, the one after re-sends it mutated. The boundary the harness hunts is any
+     * instant where a binding's commit and its transaction's commit could come apart, and a
+     * schedule tied to the keyed postings themselves puts a binding's whole life — bound,
+     * replayed, conflicted — inside every window the history walks, whatever the generator
+     * made of the slots in between.
+     *
+     * <p>The clock is frozen at the epoch for the whole run, so a binding's age is a property of
+     * the history rather than of the wall clock: replays replay and conflicts conflict in both
+     * the child and the parent's fold, on any day either of them runs.
+     */
+    private void keyedPosting(int index, Transaction candidate) throws IOException {
+      String merchant = "merchant-" + index % 3;
+      String key = "key-" + index;
+      try {
+        dev.ledgerx.idempotency.IdempotentReceipt receipt =
+            ledger.postIdempotent(MerchantId.of(merchant), IdempotencyKey.of(key), candidate);
+        model.commit(receipt.transaction());
+        lastKeyed = new KeyedBody(merchant, key, receipt.transaction());
+        schedule.add("R");
+        schedule.add("C");
+        ackLine(
+            "I " + merchant + " " + key + " " + postedText(receipt.transaction()).substring(2));
+      } catch (RejectedTransactionException refused) {
+        out.println("N " + refused.reason());
+      }
+    }
+
+    /** A retry of the last keyed body: the response replays, nothing appends, nothing acks. */
+    private void retry() throws IOException {
+      dev.ledgerx.idempotency.IdempotentReceipt receipt =
+          ledger.postIdempotent(
+              MerchantId.of(lastKeyed.merchant()), IdempotencyKey.of(lastKeyed.key()),
+              lastKeyed.body());
+      if (!receipt.replayed()) {
+        throw new IllegalStateException(
+            "a retry of " + lastKeyed.key() + " posted instead of replaying");
+      }
+      out.println(
+          "R " + lastKeyed.merchant() + " " + lastKeyed.key() + " " + receipt.originalLsn()
+              + " " + postedText(lastKeyed.body()).substring(2));
+    }
+
+    /**
+     * The client bug the 409 exists for: the last key re-sent with every amount nudged by one.
+     * Still balanced, still naming known accounts — everything about it is plausible except the
+     * key, which is exactly the shape of divergence a 200-replay would have hidden.
+     */
+    private void mutatedReuse() throws IOException {
+      List<Entry> nudged = new ArrayList<>(lastKeyed.body().size());
+      for (Entry entry : lastKeyed.body().entries()) {
+        nudged.add(
+            new Entry(
+                entry.account(), entry.side(),
+                Money.ofMinor(entry.amount().minorUnits() + 1L)));
+      }
+      Transaction mutated = new Transaction(nudged);
+      try {
+        ledger.postIdempotent(
+            MerchantId.of(lastKeyed.merchant()), IdempotencyKey.of(lastKeyed.key()), mutated);
+        throw new IllegalStateException(
+            "a mutated body under " + lastKeyed.key() + " was accepted");
+      } catch (dev.ledgerx.idempotency.IdempotencyConflictException conflict) {
+        out.println(
+            "C " + lastKeyed.merchant() + " " + lastKeyed.key() + " "
+                + postedText(mutated).substring(2));
+      }
+    }
+
+    /** The last keyed body, kept for the retry and conflict verbs to re-send. */
+    private record KeyedBody(String merchant, String key, Transaction body) {}
 
     /** One ack line, carrying the two offsets the parent needs to state the obligation. */
     private void ackLine(String op) {
