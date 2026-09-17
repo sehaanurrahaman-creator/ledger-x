@@ -259,6 +259,37 @@ public final class Wal implements AutoCloseable {
     }
   }
 
+  /**
+   * Forces the bytes written so far, whatever the active policy says, and returns once they are
+   * durable.
+   *
+   * <p>The WAL's own ack rule never needs this — a forcing policy forces its group, and a
+   * non-forcing one promises nothing to force. The checkpoint does: ADR 0003 §10 handed this
+   * ticket the rule that <em>a snapshot may only be written after the log bytes it covers have been
+   * forced</em>, and under {@link FsyncPolicy#NO_FSYNC} nothing else in the log will ever force
+   * them. A checkpoint's coverage claim is therefore only as good as its own force, which is why
+   * the operation exists: it is the one place where a caller may ask for more durability than the
+   * policy promised, and a force is never a promise broken, only one kept early.
+   *
+   * <p>Concurrent appends only add bytes past what this call covers, so this cannot weaken an
+   * ack: {@code writtenThrough} is read before the force, and the watermark moves to the larger of
+   * what it was and what this call covered. A failed force marks the log dead, exactly as a failed
+   * force on the committer's thread does — a device that will not flush is not a device to keep
+   * promising on.
+   */
+  public void forceData() throws IOException {
+    long through = writtenThrough;
+    try {
+      channel.forceData();
+    } catch (IOException failed) {
+      fail(failed);
+      throw failed;
+    }
+    if (through > durableThrough) {
+      durableThrough = through;
+    }
+  }
+
   /** Bytes a completed force covers. Every record acked under a forcing policy ends at or below. */
   public long durableThrough() {
     return durableThrough;

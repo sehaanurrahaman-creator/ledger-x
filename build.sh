@@ -5,7 +5,8 @@
 #   ./build.sh            lint, compile, the substrate contract, the WAL contract, the properties
 #   ./build.sh compile    lint and compile, run nothing
 #   ./build.sh crash      the kill -9 micro-harness: 1,000 random kill/recover cycles per policy
-#   ./build.sh test       compile and run both test mains
+#   ./build.sh boundary   the checkpoint harness: every prefix of a history, crash, recover, hash
+#   ./build.sh test       compile and run the test mains
 #   ./build.sh demo       compile and run the transfer demo — what `make demo` runs
 #   ./build.sh campaign   the property suite at a much larger campaign than CI runs
 #   ./build.sh lint       style lint only
@@ -31,6 +32,8 @@ readonly TEST_OUT="${BUILD_DIR}/classes/test"
 readonly CONTRACT_ENTRY="dev.ledgerx.substrate.SubstrateContract"
 readonly WAL_CONTRACT_ENTRY="dev.ledgerx.wal.WalContract"
 readonly CRASH_ENTRY="dev.ledgerx.wal.crash.CrashHarness"
+readonly CHECKPOINT_CONTRACT_ENTRY="dev.ledgerx.checkpoint.CheckpointContract"
+readonly BOUNDARY_ENTRY="dev.ledgerx.checkpoint.crash.LsnBoundaryHarness"
 readonly PROPERTIES_ENTRY="dev.ledgerx.domain.DomainModelProperties"
 readonly DEMO_ENTRY="dev.ledgerx.demo.TransferDemo"
 readonly JAVAC_FLAGS=(--release "${RELEASE}" -Xlint:all -Werror -encoding UTF-8)
@@ -49,6 +52,13 @@ readonly CAMPAIGN_OPERATIONS=400
 #   LEDGER_X_CRASH_CYCLES=5000 LEDGER_X_CRASH_OPS=200 ./build.sh crash
 readonly CRASH_CYCLES="${LEDGER_X_CRASH_CYCLES:-1000}"
 readonly CRASH_OPS="${LEDGER_X_CRASH_OPS:-24}"
+
+# The checkpoint boundary harness: every prefix of a seeded history, in three configurations,
+# plus a kill inside every stage of the swap. 16 operations is 3 x 17 + 15 = 66 cycles and takes
+# well under a minute; every prefix is a crash a recovery has to land on. Override with
+#   LEDGER_X_BOUNDARY_OPS=64 LEDGER_X_BOUNDARY_SEED=20260921 ./build.sh boundary
+readonly BOUNDARY_OPS="${LEDGER_X_BOUNDARY_OPS:-16}"
+readonly BOUNDARY_SEED="${LEDGER_X_BOUNDARY_SEED:-20260918}"
 
 log() { printf '\n==> %s\n' "$*"; }
 
@@ -196,6 +206,12 @@ do_wal_contract() {
   annotate "${log_file}"
 }
 
+do_checkpoint_contract() {
+  local log_file="${BUILD_DIR}/checkpoint-contract.log"
+  run_main "checkpoint contract" "${CHECKPOINT_CONTRACT_ENTRY}" "${log_file}"
+  annotate "${log_file}"
+}
+
 do_properties() {
   local log_file="${BUILD_DIR}/property-test.log"
   campaign_opts
@@ -215,6 +231,7 @@ do_demo() {
 do_test() {
   do_contract_test
   do_wal_contract
+  do_checkpoint_contract
   do_properties
 }
 
@@ -242,6 +259,31 @@ do_crash() {
   annotate "${log_file}"
 }
 
+do_boundary() {
+  local log_file="${BUILD_DIR}/boundary-harness.log"
+  log "checkpoint boundary harness: ${BOUNDARY_OPS} operations per history, seed ${BOUNDARY_SEED}"
+  local status=0
+  if ! java "${JAVA_OPTS[@]}" \
+    -Dledgerx.boundary.ops="${BOUNDARY_OPS}" \
+    -Dledgerx.boundary.seed="${BOUNDARY_SEED}" \
+    -cp "${MAIN_OUT}:${TEST_OUT}" "${BOUNDARY_ENTRY}" | tee "${log_file}"; then
+    status=1
+  fi
+  if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+    {
+      printf '### checkpoint boundary harness\n\n```\n'
+      grep -E "^== |^  [0-9]+ cycles|^boundary harness|^PASS|^FAIL" "${log_file}" \
+        || tail -n 20 "${log_file}"
+      printf '\n```\n'
+    } >> "${GITHUB_STEP_SUMMARY}"
+  fi
+  if [ "${status}" -ne 0 ]; then
+    annotate_failure "boundary harness" "${log_file}" tail
+    exit 1
+  fi
+  annotate "${log_file}"
+}
+
 do_campaign() {
   local log_file="${BUILD_DIR}/property-test.log"
   log "domain model properties: extended campaign (${CAMPAIGN_TRIALS} cases x \
@@ -262,11 +304,14 @@ case "${1:-all}" in
   compile)  require_java; do_compile ;;
   test)     require_java; do_compile; do_test ;;
   crash)    require_java; do_compile; do_crash ;;
+  boundary) require_java; do_compile; do_boundary ;;
   demo)     require_java; do_compile; do_demo ;;
   campaign) require_java; do_compile; do_campaign ;;
   lint)     do_lint ;;
   clean)    do_clean ;;
-  *)        echo "usage: $0 [all|compile|test|demo|crash|campaign|lint|clean]" >&2; exit 2 ;;
+  *)        echo \
+              "usage: $0 [all|compile|test|demo|crash|boundary|campaign|lint|clean]" >&2; \
+            exit 2 ;;
 esac
 
 log "done"

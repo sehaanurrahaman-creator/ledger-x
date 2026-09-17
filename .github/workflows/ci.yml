@@ -44,6 +44,12 @@ jobs:
       - name: Kill -9 micro-harness
         run: make crash
 
+      # ADR 0004's evidence: every prefix of a seeded history is crashed at a boundary, recovered
+      # and hashed, in three configurations, plus a kill inside every stage of the swap. Every
+      # cycle must land on the same state hash, and checkpoint + tail must equal a full replay.
+      - name: Checkpoint boundary harness
+        run: make boundary
+
       # The same properties at ~10x the operations, ~20s. Timing data for the map's CI-budget
       # fog: this step is the expensive one and it is still cheap.
       - name: Extended property campaign

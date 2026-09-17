@@ -5,8 +5,10 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.LinkedHashSet;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 
 /**
  * The whole ledger, in memory: one append-only event log, an index of balances derived from
@@ -44,6 +46,27 @@ public final class InMemoryLedger {
   private final Map<AccountId, Long> balances = new LinkedHashMap<>();
 
   /**
+   * The balance every account had when <em>this</em> ledger's journal began: 0 for an account this
+   * ledger opened itself, and a checkpoint's number for an account restored from one.
+   *
+   * <p>It exists because a checkpoint is a fold the ledger did not perform, and a ledger that
+   * cannot say where its fold started cannot audit itself. With this map, a restored ledger is as
+   * checkable as a fresh one: its index must equal this base plus a fold of the events it has
+   * actually seen, which is exactly {@link #audit()}'s existing rule with one term added.
+   */
+  private final Map<AccountId, Long> baseBalances = new LinkedHashMap<>();
+
+  /**
+   * The accounts that came from a checkpoint rather than from an event in this ledger's journal.
+   *
+   * <p>A set of ids rather than a counter, because a counter can disagree with the maps it is
+   * supposed to summarise and a set cannot be compared against them — and because every field of
+   * this class is final, a rule the domain property suite enforces by reflection. That rule earned
+   * its keep here: the alternative was a free-standing {@code int} that no other structure held to.
+   */
+  private final Set<AccountId> restored = new LinkedHashSet<>();
+
+  /**
    * Opens an account. Appends an event and moves no money, so it cannot disturb Σ balances.
    *
    * @throws IllegalArgumentException if the id is already open — reopening an account under a
@@ -56,8 +79,44 @@ public final class InMemoryLedger {
     }
     accounts.put(id, account);
     balances.put(id, 0L);
+    baseBalances.put(id, 0L);
     events.add(new JournalEvent.AccountOpened(account));
     return account;
+  }
+
+  /**
+   * Restores an account as a checkpoint recorded it: known, ordered, and holding a balance that no
+   * event in this ledger's journal produced.
+   *
+   * <p>This is recovery's write path into the domain and the only method here that adds state
+   * without appending an event — because the event exists, in the log, <em>before</em> the
+   * checkpoint's watermark, and the checkpoint's whole job is to stand in for the part of the
+   * journal the ledger is not going to hold. It is why ADR 0004 §9 records a domain change: before
+   * it, "the log is the truth and the balances are an index of it" was a claim about a fold from
+   * event one, and a snapshot makes the fold start in the middle.
+   *
+   * <p>It refuses a duplicate the same way {@link #openAccount} does, so a log that opens an
+   * account a checkpoint already restored is a refusal at replay rather than a silent overwrite.
+   *
+   * @param account the account, with the kind it had
+   * @param openingBalance its balance at the checkpoint's watermark
+   */
+  public void restore(Account account, Money openingBalance) {
+    Objects.requireNonNull(account, "restored account");
+    Objects.requireNonNull(openingBalance, "restored balance");
+    if (accounts.containsKey(account.id())) {
+      throw new IllegalArgumentException(
+          "already open: " + account.id() + " (" + account.kind() + ")");
+    }
+    accounts.put(account.id(), account);
+    balances.put(account.id(), openingBalance.minorUnits());
+    baseBalances.put(account.id(), openingBalance.minorUnits());
+    restored.add(account.id());
+  }
+
+  /** How many accounts were restored from a checkpoint rather than opened by an event here. */
+  public int restoredAccounts() {
+    return restored.size();
   }
 
   public boolean isKnown(AccountId id) {
@@ -260,11 +319,19 @@ public final class InMemoryLedger {
   }
 
   /**
-   * Recomputes every balance from the event log, ignoring the index. Slow, obvious, and the
-   * reference the index is judged against.
+   * Recomputes every balance from the base plus the event log, ignoring the index. Slow, obvious,
+   * and the reference the index is judged against.
+   *
+   * <p>The base is the only difference between this and a fold of the journal: an account restored
+   * from a checkpoint starts at the balance the checkpoint recorded, and the events that moved it
+   * before the checkpoint are not in this ledger's journal to be folded. For a ledger that was
+   * never restored, the base is all zeros and this is exactly the fold ADR 0002 described.
    */
   public Map<AccountId, Money> foldBalances() {
     Map<AccountId, BigInteger> folded = new LinkedHashMap<>();
+    for (Map.Entry<AccountId, Long> row : baseBalances.entrySet()) {
+      folded.put(row.getKey(), BigInteger.valueOf(row.getValue()));
+    }
     for (JournalEvent event : events) {
       if (event instanceof JournalEvent.AccountOpened opened) {
         folded.putIfAbsent(opened.account().id(), BigInteger.ZERO);
@@ -338,12 +405,40 @@ public final class InMemoryLedger {
       sequence++;
     }
 
-    if (!openedByLog.equals(accounts)) {
+    // The account index is the restored base plus what the log opened, and nothing else: an account
+    // the index holds that neither opened and never restored was invented, and an account the log
+    // opens that the index does not hold was lost. The last clause is ADR 0002's check; the first
+    // two are what a restore has to be held to, and between them they say the index is partitioned
+    // by two disjoint sets rather than merely summed by two numbers.
+    if (accounts.size() != openedByLog.size() + restored.size()) {
       throw new IllegalStateException(
-          "account index disagrees with the log: index="
+          "account index disagrees with the log: the index holds "
+              + accounts.size()
+              + " accounts, the log opens "
+              + openedByLog.size()
+              + " and "
+              + restored.size()
+              + " were restored from a checkpoint");
+    }
+    if (!baseBalances.keySet().equals(accounts.keySet())) {
+      throw new IllegalStateException(
+          "account index disagrees with the balance base: index="
               + accounts.keySet()
-              + " log="
-              + openedByLog.keySet());
+              + " base="
+              + baseBalances.keySet());
+    }
+    for (Map.Entry<AccountId, Account> row : openedByLog.entrySet()) {
+      if (restored.contains(row.getKey())) {
+        throw new IllegalStateException(
+            "account index disagrees with the log: " + row.getKey()
+                + " came from a checkpoint and is opened again by the log");
+      }
+      Account indexed = accounts.get(row.getKey());
+      if (!row.getValue().equals(indexed)) {
+        throw new IllegalStateException(
+            "account index disagrees with the log on " + row.getKey() + ": index=" + indexed
+                + " log=" + row.getValue());
+      }
     }
 
     Map<AccountId, Money> folded = foldBalances();

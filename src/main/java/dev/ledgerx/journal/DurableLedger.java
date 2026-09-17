@@ -1,5 +1,10 @@
 package dev.ledgerx.journal;
 
+import dev.ledgerx.checkpoint.Checkpoint;
+import dev.ledgerx.checkpoint.CheckpointListener;
+import dev.ledgerx.checkpoint.CheckpointPolicy;
+import dev.ledgerx.checkpoint.CheckpointStore;
+import dev.ledgerx.checkpoint.LedgerState;
 import dev.ledgerx.domain.Account;
 import dev.ledgerx.domain.AccountId;
 import dev.ledgerx.domain.AccountKind;
@@ -10,15 +15,18 @@ import dev.ledgerx.domain.Transaction;
 import dev.ledgerx.wal.FsyncPolicy;
 import dev.ledgerx.wal.RecordType;
 import dev.ledgerx.wal.Wal;
+import dev.ledgerx.wal.WalFormat;
 import dev.ledgerx.wal.WalRecovery;
+import dev.ledgerx.wal.WalRecord;
 import java.io.IOException;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * A ledger you can trust across {@code kill -9}: ADR 0002's in-memory model with ADR 0003's log
- * underneath it, and the thing the record format and the fsync menu are for.
+ * underneath it, and — since ADR 0004 — a checkpoint above it.
  *
  * <p><strong>The commit protocol, in the order it happens.</strong> One critical section holds
  * {@link ReentrantLock} (never {@code synchronized}, per ADR 0001's pinning rule), validates the
@@ -39,29 +47,84 @@ import java.util.concurrent.locks.ReentrantLock;
  * before the ack, which needs the domain's validation exposed as a separate step; ADR 0003 §9
  * records that as the one thing this ticket had to ask of ADR 0002 and did not, and hands it to the
  * concurrency ticket, where the same critical section is also where per-account ordering lives.
+ *
+ * <p><strong>Recovery is a checkpoint plus a tail, and the tail is the log's.</strong> Opening
+ * scans the log exactly as it did before this ticket — a tear is cut, a marker records the
+ * cut — and then asks the checkpoint store for the newest checkpoint that stands up against it.
+ * A usable checkpoint seeds the ledger ({@link LedgerState#restore()}) and the fold starts at its
+ * watermark ({@link Replay#foldAfter}); an unusable one changes nothing, because a checkpoint is a
+ * cache of a fold and the log is the truth. Either way the ledger audits before it serves, so a
+ * recovery that produced a state which disagrees with its own index refuses to open rather than
+ * print a wrong balance.
+ *
+ * <p><strong>A checkpoint is taken inside the commit lock, after the ack.</strong> The state and
+ * the position it claims must describe the same instant, and the lock is the only thing that makes
+ * that true; it also means a checkpoint never sees an applied-but-unacked record, which is what
+ * makes its coverage claim a claim about durable bytes. The bytes are then forced before anything
+ * is written ({@link Wal#forceData()}), for the ordering rule ADR 0003 §10 handed over.
+ * A <em>failed</em> checkpoint is not a failed ledger: nothing in memory changed, the log is
+ * untouched, and the cache simply was not refreshed — so the commit that triggered an automatic
+ * checkpoint still returns its transaction, and the failure is counted rather than thrown. A
+ * caller that asks for a checkpoint explicitly gets the exception, because a caller that asks
+ * deserves an answer.
  */
 public final class DurableLedger implements AutoCloseable {
 
   private final Wal wal;
   private final InMemoryLedger ledger;
   private final WalRecovery.Report recovery;
+  private final CheckpointStore checkpointStore;
+  private final CheckpointPolicy checkpointPolicy;
+  private final CheckpointStore.Load checkpointLoad;
+  private final int replayedRecords;
   private final ReentrantLock commitLock = new ReentrantLock();
 
   private volatile IOException failure;
+  private volatile CheckpointListener checkpointListener = CheckpointListener.NONE;
   private Wal.Ack lastAck;
 
-  private DurableLedger(Wal wal, InMemoryLedger ledger, WalRecovery.Report recovery) {
+  /** The LSN of the last journal record this ledger's state includes; 0 before the first one. */
+  private long lastJournalLsn;
+
+  /** The byte offset just past that record's frame, which is the coverage a checkpoint claims. */
+  private long lastJournalEnd = WalFormat.SEGMENT_HEADER_BYTES;
+
+  private int commitsSinceCheckpoint;
+  private long checkpointsWritten;
+  private long checkpointFailures;
+  private String lastCheckpointFailure;
+
+  private DurableLedger(
+      Wal wal,
+      InMemoryLedger ledger,
+      WalRecovery.Report recovery,
+      CheckpointStore checkpointStore,
+      CheckpointPolicy checkpointPolicy,
+      CheckpointStore.Load checkpointLoad,
+      int replayedRecords,
+      long lastJournalLsn,
+      long lastJournalEnd) {
     this.wal = wal;
     this.ledger = ledger;
     this.recovery = recovery;
+    this.checkpointStore = checkpointStore;
+    this.checkpointPolicy = checkpointPolicy;
+    this.checkpointLoad = checkpointLoad;
+    this.replayedRecords = replayedRecords;
+    this.lastJournalLsn = lastJournalLsn;
+    this.lastJournalEnd = lastJournalEnd;
   }
 
   /**
    * Opens the ledger stored in {@code directory}: recover the log, cut a torn tail, replay the
    * clean prefix into a fresh ledger, and start accepting commits under {@code policy}.
+   *
+   * <p>Checkpoints are taken automatically under {@link CheckpointPolicy#DEFAULT}. The overload
+   * that takes a policy is how a caller chooses otherwise, and {@link CheckpointPolicy#MANUAL} is
+   * how it says "only when I ask".
    */
   public static DurableLedger open(Path directory, FsyncPolicy policy) throws IOException {
-    return open(directory, policy, true);
+    return open(directory, policy, true, CheckpointPolicy.DEFAULT);
   }
 
   /**
@@ -70,15 +133,38 @@ public final class DurableLedger implements AutoCloseable {
    */
   public static DurableLedger open(Path directory, FsyncPolicy policy, boolean repair)
       throws IOException {
+    return open(directory, policy, repair, CheckpointPolicy.DEFAULT);
+  }
+
+  /** The full open: the fsync policy, recovery's repair switch, and the checkpoint cadence. */
+  public static DurableLedger open(
+      Path directory, FsyncPolicy policy, boolean repair, CheckpointPolicy checkpoints)
+      throws IOException {
+    Objects.requireNonNull(directory, "ledger directory");
+    Objects.requireNonNull(checkpoints, "checkpoint policy");
     Wal wal = Wal.open(directory.resolve(Wal.FILE_NAME), policy, repair);
+    CheckpointStore store = new CheckpointStore(directory);
+    CheckpointStore.Load load;
     InMemoryLedger replayed;
+    int tail;
     try {
-      replayed = Replay.fold(wal.recovered());
+      load = store.load(wal.file(), wal.recovered());
+      if (load.used()) {
+        replayed = load.checkpoint().state().restore();
+        tail = Replay.foldAfter(load.checkpoint().lastLsn(), wal.recovered(), replayed);
+      } else {
+        replayed = Replay.fold(wal.recovered());
+        tail = replayed.size();
+      }
     } catch (IOException | RuntimeException cannotReplay) {
       wal.close();
       throw cannotReplay;
     }
-    return new DurableLedger(wal, replayed, wal.recovery());
+    long lastLsn = Replay.lastJournalLsn(wal.recovered());
+    long lastEnd =
+        lastLsn == 0L ? WalFormat.SEGMENT_HEADER_BYTES : wal.recovered().endOf(lastLsn);
+    return new DurableLedger(
+        wal, replayed, wal.recovery(), store, checkpoints, load, tail, lastLsn, lastEnd);
   }
 
   /**
@@ -99,7 +185,9 @@ public final class DurableLedger implements AutoCloseable {
       requireHealthy();
       JournalEvent event = new JournalEvent.AccountOpened(new Account(id, kind));
       ack(EventCodec.typeOf(event), EventCodec.encode(event), wal.policy());
-      return ledger.openAccount(id, kind);
+      Account opened = ledger.openAccount(id, kind);
+      afterCommit();
+      return opened;
     } finally {
       commitLock.unlock();
     }
@@ -133,12 +221,66 @@ public final class DurableLedger implements AutoCloseable {
       Transaction accepted = ledger.post(candidate);
       JournalEvent event = new JournalEvent.Posted(accepted);
       ack(EventCodec.typeOf(event), EventCodec.encode(event), policy);
+      afterCommit();
       return accepted;
     } catch (IOException storageFailed) {
       failure = storageFailed;
       throw storageFailed;
     } finally {
       commitLock.unlock();
+    }
+  }
+
+  /**
+   * Takes a checkpoint of the state as it stands: the state hash of a run, the number a crash's
+   * recovery has to reproduce.
+   *
+   * <p>The order is the ticket's: force the log through the coverage first, build the state and the
+   * bindings, then write the file through the store's swap (temp, force, rename, sync the
+   * directory, collect). The whole thing happens under the commit lock, so the watermark and the
+   * state describe the same instant, and no append can slip in between them.
+   *
+   * @return the checkpoint that is now on disk
+   */
+  public Checkpoint checkpoint() throws IOException {
+    commitLock.lock();
+    try {
+      requireHealthy();
+      return writeCheckpoint();
+    } finally {
+      commitLock.unlock();
+    }
+  }
+
+  /** The commit-lock-held body, shared by {@link #checkpoint()} and the automatic cadence. */
+  private Checkpoint writeCheckpoint() throws IOException {
+    // The ordering rule of ADR 0003 §10, in one line: a snapshot may only claim bytes that are
+    // already durable, and under NO_FSYNC this is the only force those bytes will ever get.
+    wal.forceData();
+    LedgerState state = LedgerState.of(ledger, lastJournalLsn);
+    Checkpoint written =
+        Checkpoint.of(state, lastJournalEnd, wal.file());
+    checkpointStore.write(written, checkpointPolicy.retain(), checkpointListener);
+    commitsSinceCheckpoint = 0;
+    checkpointsWritten++;
+    return written;
+  }
+
+  /**
+   * The cadence, after a commit has been acked and applied. An automatic checkpoint that fails does
+   * not fail the commit that triggered it: the money is durable, the checkpoint is not the money,
+   * and the failure is counted for whoever is reading the counters.
+   */
+  private void afterCommit() {
+    commitsSinceCheckpoint++;
+    if (!checkpointPolicy.due(commitsSinceCheckpoint)) {
+      return;
+    }
+    try {
+      writeCheckpoint();
+    } catch (IOException couldNotCheckpoint) {
+      checkpointFailures++;
+      lastCheckpointFailure = couldNotCheckpoint.getMessage();
     }
   }
 
@@ -154,6 +296,66 @@ public final class DurableLedger implements AutoCloseable {
   /** What recovery found and did on the way in, including any tear it cut. */
   public WalRecovery.Report recovery() {
     return recovery;
+  }
+
+  /** What the checkpoint store found on the way in: which file, or none, and what it refused. */
+  public CheckpointStore.Load checkpointLoad() {
+    return checkpointLoad;
+  }
+
+  /** How many journal records the fold applied on the way in — the whole log, or just a tail. */
+  public int replayedRecords() {
+    return replayedRecords;
+  }
+
+  /**
+   * The state hash of the ledger as it stands: SHA-256 over the canonical state at
+   * {@link #lastJournalLsn()}, in the exact form ADR 0004 §3 defines.
+   *
+   * <p>Compare it to the hash a recovered ledger prints, or to the hash inside a checkpoint file.
+   * Equality is the claim: same accounts, same kinds, same order, same balances, same position in
+   * the log — not "equivalent money", the same bytes.
+   */
+  public String stateHash() {
+    return LedgerState.of(ledger, lastJournalLsn).stateHash();
+  }
+
+  /** The state itself, for a caller that wants to compare more than a hash. */
+  public LedgerState state() {
+    return LedgerState.of(ledger, lastJournalLsn);
+  }
+
+  /** The LSN of the last journal record this ledger's state includes; 0 before the first. */
+  public long lastJournalLsn() {
+    return lastJournalLsn;
+  }
+
+  /** The offset just past that record's frame, which a checkpoint of this state would cover. */
+  public long lastJournalEnd() {
+    return lastJournalEnd;
+  }
+
+  /** How many checkpoints this instance has written, automatic ones included. */
+  public long checkpointsWritten() {
+    return checkpointsWritten;
+  }
+
+  /** How many automatic checkpoints failed. Non-zero means a stale cache, not lost money. */
+  public long checkpointFailures() {
+    return checkpointFailures;
+  }
+
+  /** The last automatic checkpoint's failure message, or {@code null}. */
+  public String lastCheckpointFailure() {
+    return lastCheckpointFailure;
+  }
+
+  /**
+   * Watches the swap's stages. One listener, last one wins, and it runs on the committing thread
+   * inside the commit lock — an operator's timer or a harness's crash point, and nothing else.
+   */
+  public void onCheckpointStage(CheckpointListener listener) {
+    this.checkpointListener = listener == null ? CheckpointListener.NONE : listener;
   }
 
   /**
@@ -177,6 +379,10 @@ public final class DurableLedger implements AutoCloseable {
   private void ack(RecordType type, byte[] payload, FsyncPolicy policy) throws IOException {
     Wal.Ack acked = wal.appendSync(type, payload, policy);
     lastAck = acked;
+    if (type.isJournalEvent()) {
+      lastJournalLsn = acked.lsn().value();
+      lastJournalEnd = acked.end();
+    }
   }
 
   private void requireHealthy() {
@@ -193,5 +399,10 @@ public final class DurableLedger implements AutoCloseable {
   @Override
   public void close() throws IOException {
     wal.close();
+  }
+
+  /** Every record the recovery scan validated, for a caller that wants to fold or hash it again. */
+  public List<WalRecord> recoveredRecords() {
+    return wal.recovered().records();
   }
 }

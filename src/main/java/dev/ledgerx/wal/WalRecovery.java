@@ -100,6 +100,39 @@ public final class WalRecovery {
       return List.copyOf(events);
     }
 
+    /**
+     * The byte offset just past the frame carrying {@code lsn} — which is what a checkpoint
+     * <em>covers</em>, and therefore the offset a recovery would resume reading at.
+     *
+     * <p>It is a walk over the frames already in memory rather than a field, because an offset is
+     * derivable from the frames (they are all present, and each declares its own length) and a
+     * second stored copy of a position is a second source of truth about it. Density is what makes
+     * the walk a proof: the frames here are {@code 1..n} in order, so "the end of frame 42" is the
+     * same number whether the walk counts lengths or the writer recorded its ack.
+     *
+     * @param lsn the sequence number, or 0 for "before the first record" — the empty state's
+     *     coverage, which is exactly the segment header
+     * @throws IllegalArgumentException if the clean prefix does not hold that frame, which is how a
+     *     checkpoint whose coverage the log no longer has becomes a refusal instead of a bug
+     */
+    public long endOf(long lsn) {
+      if (lsn == 0L) {
+        return WalFormat.SEGMENT_HEADER_BYTES;
+      }
+      long offset = WalFormat.SEGMENT_HEADER_BYTES;
+      for (WalRecord record : records) {
+        offset += record.frameLength();
+        if (record.lsn().value() == lsn) {
+          return offset;
+        }
+        if (record.lsn().value() > lsn) {
+          break;
+        }
+      }
+      throw new IllegalArgumentException(
+          "the clean prefix ends at lsn " + report.lastLsn() + " and holds no frame at lsn " + lsn);
+    }
+
     /** The last {@code RECOVERY_MARKER} in the log, or {@code null} if there is none. */
     public WalRecord lastMarker() {
       for (int i = records.size() - 1; i >= 0; i--) {
