@@ -360,8 +360,9 @@ public final class CheckpointContract {
     for (long cut : new long[] {WalFormat.SEGMENT_HEADER_BYTES, watermark / 2, watermark - 1}) {
       WalRecovery.truncateTo(wal, cut);
       byte[] torn = Files.readAllBytes(wal);
-      try (DurableLedger ignored = DurableLedger.open(sub, FsyncPolicy.GROUP_COMMIT)) {
-        throw new AssertionError("cut at " + cut + ": a checkpoint ahead of its log opened");
+      try (DurableLedger opened = DurableLedger.open(sub, FsyncPolicy.GROUP_COMMIT)) {
+        throw new AssertionError("cut at " + cut + ": a checkpoint ahead of its log opened ("
+            + opened.checkpointAtOpen() + ")");
       } catch (UnrecoverableLogException refused) {
         if (refused.corruption() != Corruption.CHECKPOINT_MISMATCH) {
           throw new AssertionError("cut at " + cut + " refused as " + refused.corruption());
@@ -378,8 +379,9 @@ public final class CheckpointContract {
     WalFormat.putLong(file, 20, WalFormat.longAt(file, 20) + 3L);
     rewriteChecksums(file);
     Files.write(checkpoint, file);
-    try (DurableLedger ignored = DurableLedger.open(sub, FsyncPolicy.GROUP_COMMIT)) {
-      throw new AssertionError("a moved watermark offset opened");
+    try (DurableLedger opened = DurableLedger.open(sub, FsyncPolicy.GROUP_COMMIT)) {
+      throw new AssertionError("a moved watermark offset opened (" + opened.checkpointAtOpen()
+          + ")");
     } catch (UnrecoverableLogException refused) {
       if (refused.corruption() != Corruption.CHECKPOINT_MISMATCH) {
         throw new AssertionError("a moved offset refused as " + refused.corruption());
@@ -391,8 +393,9 @@ public final class CheckpointContract {
     WalFormat.putLong(file, 20, intactLog.length);
     rewriteChecksums(file);
     Files.write(checkpoint, file);
-    try (DurableLedger ignored = DurableLedger.open(sub, FsyncPolicy.GROUP_COMMIT)) {
-      throw new AssertionError("a watermark lsn past the log's end opened");
+    try (DurableLedger opened = DurableLedger.open(sub, FsyncPolicy.GROUP_COMMIT)) {
+      throw new AssertionError("a watermark lsn past the log's end opened ("
+          + opened.checkpointAtOpen() + ")");
     } catch (UnrecoverableLogException refused) {
       if (refused.corruption() != Corruption.CHECKPOINT_MISMATCH) {
         throw new AssertionError("an over-lsn checkpoint refused as " + refused.corruption());
