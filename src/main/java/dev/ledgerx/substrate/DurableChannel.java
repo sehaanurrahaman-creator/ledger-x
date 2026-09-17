@@ -12,8 +12,8 @@ import java.nio.file.StandardOpenOption;
  * <p>There is deliberately no ledger here: no accounts, no entries, no balances, no replay. This
  * class exists so that the boundaries in ADR 0001's commit table are the only way anything reaches
  * storage, and so that the substrate contract test can prove they behave as the ADR claims. Every
- * file the write-ahead log touches is opened through these five methods, which is what makes "the
- * WAL owns its own fsync" a checkable statement rather than a review habit.
+ * file the write-ahead log touches is opened through these methods and no others, which is what
+ * makes "the WAL owns its own fsync" a checkable statement rather than a review habit.
  *
  * <p>On Linux the {@code force} variants are exactly one syscall each:
  * {@code FileChannel.force(false)} is {@code fdatasync(fd)} and {@code FileChannel.force(true)} is
@@ -22,7 +22,8 @@ import java.nio.file.StandardOpenOption;
  * <p>ADR 0003 added the two operations recovery needs and no others: a positioned read, because a
  * scan must not disturb the append handle, and a truncate, because cutting a torn tail is the
  * decided repair. {@link #truncateTo} is the only method here that destroys data, which is why it
- * takes a length and not a direction.
+ * takes a length and not a direction. ADR 0004 added one more, {@link #openForRewrite}, for the
+ * scratch file a checkpoint is written to before it is renamed into place.
  */
 public final class DurableChannel implements AutoCloseable {
 
@@ -55,6 +56,24 @@ public final class DurableChannel implements AutoCloseable {
    */
   public static DurableChannel openForTruncate(Path file) throws IOException {
     return new DurableChannel(FileChannel.open(file, StandardOpenOption.WRITE));
+  }
+
+  /**
+   * Opens a scratch file for a complete rewrite, creating it and discarding whatever it held.
+   *
+   * <p>ADR 0004 added this one, and it exists for a checkpoint's temporary file: a snapshot is
+   * written whole, forced, and only then renamed into place, so the handle it needs is
+   * write-and-replace rather than append. Nothing else in the repository may rewrite a file's
+   * earlier bytes, and keeping the exception inside this class is what keeps that a checkable
+   * statement.
+   */
+  public static DurableChannel openForRewrite(Path file) throws IOException {
+    return new DurableChannel(
+        FileChannel.open(
+            file,
+            StandardOpenOption.CREATE,
+            StandardOpenOption.WRITE,
+            StandardOpenOption.TRUNCATE_EXISTING));
   }
 
   /** Writes every remaining byte. Partial writes are retried until the buffer is drained. */

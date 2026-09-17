@@ -1,5 +1,6 @@
 package dev.ledgerx.journal;
 
+import dev.ledgerx.domain.AccountState;
 import dev.ledgerx.domain.InMemoryLedger;
 import dev.ledgerx.domain.JournalEvent;
 import dev.ledgerx.domain.RejectedTransactionException;
@@ -34,6 +35,8 @@ import java.util.List;
  * log: same events in, same ledger out, in the same order, with no clock, no map iteration order,
  * no random and no float anywhere in the path. Two folds of one clean prefix produce equal
  * {@code events()} lists and equal balances, and {@code WalContract} asserts it by folding twice.
+ * ADR 0004 turned that from an equality into a digest: {@link #foldFrom} continues a fold from a
+ * checkpoint, and the state it reaches has to hash identically to a fold that started at byte 0.
  */
 public final class Replay {
 
@@ -48,6 +51,32 @@ public final class Replay {
   public static InMemoryLedger foldEvents(List<WalRecord> records) throws IOException {
     InMemoryLedger ledger = new InMemoryLedger();
     for (WalRecord record : records) {
+      apply(ledger, record);
+    }
+    ledger.audit();
+    return ledger;
+  }
+
+  /**
+   * Folds a tail on top of a checkpoint's baseline: the recovery path ADR 0004 buys.
+   *
+   * <p>It is the same fold as {@link #foldEvents} and deliberately has no rule of its own — no
+   * merge, no "reconcile the snapshot against the log", no compensation. A checkpoint is a state
+   * the log already produced, so continuing the fold from it is indistinguishable from having
+   * folded all the way, which is the entire claim the checkpoint-and-replay harness tests.
+   *
+   * <p>The tail's records are re-validated exactly as a from-scratch fold validates them, so a
+   * checkpoint cannot smuggle in a transaction the ledger would refuse: a refusal is still
+   * {@link Corruption#DOMAIN_REJECTED}, and it is still fatal.
+   *
+   * @param baseline the accounts and balances the checkpoint covered, in any order
+   * @param baselineEvents how many journal events it took to reach them
+   * @param tail the records after the checkpoint's watermark, in log order
+   */
+  public static InMemoryLedger foldFrom(
+      List<AccountState> baseline, long baselineEvents, List<WalRecord> tail) throws IOException {
+    InMemoryLedger ledger = new InMemoryLedger(baseline, baselineEvents);
+    for (WalRecord record : tail) {
       apply(ledger, record);
     }
     ledger.audit();

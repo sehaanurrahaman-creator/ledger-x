@@ -2,7 +2,8 @@
 #
 # ledger-x — one command to build and test.
 #
-#   ./build.sh            lint, compile, the substrate contract, the WAL contract, the properties
+#   ./build.sh            lint, compile, the substrate contract, the WAL contract, the checkpoint
+#                         and replay contract, and the domain model's properties
 #   ./build.sh compile    lint and compile, run nothing
 #   ./build.sh crash      the kill -9 micro-harness: 1,000 random kill/recover cycles per policy
 #   ./build.sh test       compile and run both test mains
@@ -30,6 +31,7 @@ readonly MAIN_OUT="${BUILD_DIR}/classes/main"
 readonly TEST_OUT="${BUILD_DIR}/classes/test"
 readonly CONTRACT_ENTRY="dev.ledgerx.substrate.SubstrateContract"
 readonly WAL_CONTRACT_ENTRY="dev.ledgerx.wal.WalContract"
+readonly CHECKPOINT_CONTRACT_ENTRY="dev.ledgerx.checkpoint.CheckpointContract"
 readonly CRASH_ENTRY="dev.ledgerx.wal.crash.CrashHarness"
 readonly PROPERTIES_ENTRY="dev.ledgerx.domain.DomainModelProperties"
 readonly DEMO_ENTRY="dev.ledgerx.demo.TransferDemo"
@@ -196,6 +198,26 @@ do_wal_contract() {
   annotate "${log_file}"
 }
 
+# ADR 0004's evidence: the state hash, the checkpoint format, and a crash at every LSN boundary of
+# every random history. Campaign size is an environment variable like the property suite's:
+#   LEDGER_X_CKPT_HISTORIES=400 LEDGER_X_CKPT_OPS=60 ./build.sh test
+do_checkpoint_contract() {
+  local log_file="${BUILD_DIR}/checkpoint-contract.log"
+  local opts=()
+  if [ -n "${LEDGER_X_CKPT_HISTORIES:-}" ]; then
+    opts+=("-Dledgerx.checkpoint.histories=${LEDGER_X_CKPT_HISTORIES}")
+  fi
+  if [ -n "${LEDGER_X_CKPT_OPS:-}" ]; then
+    opts+=("-Dledgerx.checkpoint.ops=${LEDGER_X_CKPT_OPS}")
+  fi
+  run_main \
+    "checkpoint-and-replay contract" \
+    "${CHECKPOINT_CONTRACT_ENTRY}" \
+    "${log_file}" \
+    ${opts[@]+"${opts[@]}"}
+  annotate "${log_file}"
+}
+
 do_properties() {
   local log_file="${BUILD_DIR}/property-test.log"
   campaign_opts
@@ -215,6 +237,7 @@ do_demo() {
 do_test() {
   do_contract_test
   do_wal_contract
+  do_checkpoint_contract
   do_properties
 }
 

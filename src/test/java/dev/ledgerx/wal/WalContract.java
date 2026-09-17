@@ -12,6 +12,7 @@ import dev.ledgerx.domain.Side;
 import dev.ledgerx.domain.Transaction;
 import dev.ledgerx.journal.DurableLedger;
 import dev.ledgerx.journal.EventCodec;
+import dev.ledgerx.journal.Replay;
 import dev.ledgerx.testing.RandomSource;
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -635,6 +636,28 @@ public final class WalContract {
           "replay is not deterministic: " + rendered.size() + " live, " + firstReplay.size()
               + " and " + secondReplay.size() + " replayed");
     }
+    // And the recovery path agrees with the fold it stands in for: the first open has no
+    // checkpoint and folds the log, the second finds the checkpoint that first open wrote and
+    // replays only the tail, and both must reach the same state digest. ADR 0004's property,
+    // asserted here so the WAL contract cannot pass on a ledger the checkpoint path broke.
+    String fromScratch;
+    String fromCheckpoint;
+    try (DurableLedger first = DurableLedger.open(ledgerDir, policy)) {
+      fromScratch = first.stateHashHex();
+    }
+    try (DurableLedger second = DurableLedger.open(ledgerDir, policy)) {
+      if (!second.checkpointDecision().used()) {
+        throw new AssertionError(
+            "the second open did not use the checkpoint the first one wrote: "
+                + second.checkpointDecision());
+      }
+      fromCheckpoint = second.stateHashHex();
+    }
+    if (!fromScratch.equals(fromCheckpoint)) {
+      throw new AssertionError(
+          "checkpoint + tail reached a different state than the fold: " + fromScratch + " vs "
+              + fromCheckpoint);
+    }
     // Byte-identical in the stronger sense too: re-encoding every replayed event reproduces the
     // payload the log holds, so what a second process writes is what a first one wrote.
     WalRecovery.Scan scan = WalRecovery.scan(ledgerDir.resolve(Wal.FILE_NAME));
@@ -649,19 +672,26 @@ public final class WalContract {
       }
       checked++;
     }
-    return firstReplay.size() + " events, folded identically twice; " + checked
-        + " payloads re-encode byte-identically";
+    return firstReplay.size() + " events, folded identically twice and matching the"
+        + " checkpoint-plus-tail recovery (" + fromScratch.substring(0, 16) + "\u2026); "
+        + checked + " payloads re-encode byte-identically";
   }
 
+  /**
+   * Folds the log at {@code dir} from byte 0, ignoring any checkpoint on disk.
+   *
+   * <p>Deliberately not {@code DurableLedger.open}: ADR 0004 made that a checkpoint-plus-tail
+   * recovery, and a ledger restored from a checkpoint holds only the tail in memory, because
+   * the log — not the event list — is the history. This check is about the fold of the log,
+   * so it calls the fold.
+   */
   private static List<String> replay(Path dir, FsyncPolicy policy) throws IOException {
-    try (DurableLedger reopened = DurableLedger.open(dir, policy)) {
-      List<String> rendered = new ArrayList<>();
-      for (JournalEvent event : reopened.ledger().events()) {
-        rendered.add(JournalDigest.canonical(event));
-      }
-      reopened.ledger().audit();
-      return rendered;
+    WalRecovery.Scan scan = WalRecovery.scan(dir.resolve(Wal.FILE_NAME));
+    List<String> rendered = new ArrayList<>();
+    for (JournalEvent event : Replay.foldEvents(scan.journalRecords()).events()) {
+      rendered.add(JournalDigest.canonical(event));
     }
+    return rendered;
   }
 
   private static String codecIsInjective(Path dir) throws IOException {

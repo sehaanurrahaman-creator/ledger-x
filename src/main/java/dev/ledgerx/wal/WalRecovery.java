@@ -86,8 +86,24 @@ public final class WalRecovery {
     }
   }
 
-  /** A report and the records it validated, in log order. Markers are in the list, and skipped. */
-  public record Scan(Report report, List<WalRecord> records) {
+  /**
+   * A report and the records it validated, in log order. Markers are in the list, and skipped.
+   *
+   * <p>{@code endOffsets} is the byte offset just <em>past</em> each record, parallel to
+   * {@code records}, and ADR 0004 added it for one reason: a checkpoint says "I cover the log
+   * through byte N at LSN k", and the only way to check that claim against a log that may since
+   * have been cut and regrown is to know where record k actually ends now. A scan already walks
+   * every one of those offsets, so this costs an array and no I/O.
+   */
+  public record Scan(Report report, List<WalRecord> records, long[] endOffsets) {
+
+    public Scan {
+      if (endOffsets.length != records.size()) {
+        throw new IllegalArgumentException(
+            endOffsets.length + " offsets for " + records.size() + " records");
+      }
+      endOffsets = endOffsets.clone();
+    }
 
     /** Only the frames a fold must apply. */
     public List<WalRecord> journalRecords() {
@@ -98,6 +114,22 @@ public final class WalRecovery {
         }
       }
       return List.copyOf(events);
+    }
+
+    /**
+     * The offset just past the record carrying {@code lsn}, or {@code -1} if the surviving prefix
+     * has no such record. LSNs are dense from 1 within a prefix (ADR 0003 §2), so the record with
+     * LSN <em>n</em> is at index <em>n</em>−1; the check is made rather than assumed.
+     */
+    public long endOffsetOf(long lsn) {
+      int index = (int) (lsn - Lsn.FIRST);
+      if (lsn < Lsn.FIRST || index >= records.size()) {
+        return -1L;
+      }
+      if (records.get(index).lsn().value() != lsn) {
+        return -1L;
+      }
+      return endOffsets[index];
     }
 
     /** The last {@code RECOVERY_MARKER} in the log, or {@code null} if there is none. */
@@ -122,9 +154,11 @@ public final class WalRecovery {
     if (size == 0L) {
       return new Scan(
           new Report(0L, 0L, 0L, 0, 0, 0, 0L, Tail.EMPTY_FILE, "the file holds no bytes"),
-          List.of());
+          List.of(),
+          new long[0]);
     }
     List<WalRecord> records = new ArrayList<>();
+    List<Long> endOffsets = new ArrayList<>();
     long position = WalFormat.SEGMENT_HEADER_BYTES;
     long nextLsn = Lsn.FIRST;
     Tail tail = Tail.CLEAN_EOF;
@@ -209,6 +243,7 @@ public final class WalRecovery {
         }
         nextLsn = record.lsn().value() + 1L;
         position += declared;
+        endOffsets.add(position);
       }
     }
     long lastLsn = nextLsn - 1L;
@@ -222,7 +257,11 @@ public final class WalRecovery {
         new Report(
             size, position, size - position, records.size(), records.size() - markers, markers,
             lastLsn, tail, detail);
-    return new Scan(report, List.copyOf(records));
+    long[] ends = new long[endOffsets.size()];
+    for (int i = 0; i < ends.length; i++) {
+      ends[i] = endOffsets.get(i);
+    }
+    return new Scan(report, List.copyOf(records), ends);
   }
 
   /** Cuts the file at {@code bytes} and makes the cut durable. The only destructive call here. */

@@ -31,6 +31,14 @@ import java.util.Objects;
  * event log by brute force. {@link #audit()} insists the two agree. An index that can
  * disagree with the log and nobody notices is how a ledger ends up with money that is not
  * there; an index that is checked against a fold on every operation cannot drift silently.
+ *
+ * <p><strong>And a third representation, since ADR 0004: a checkpoint.</strong> A ledger can be
+ * built from a baseline of {@link AccountState} rows instead of from an empty state, in which
+ * case {@link #events()} holds only the tail the log still has to replay. {@link #foldBalances()}
+ * therefore starts from the baseline and folds the tail on top of it, so the audit that keeps the
+ * index honest survives a checkpoint — an audit that only folds what is in the list would report
+ * every restored balance as missing. The baseline is immutable, is required to sum to zero, and
+ * is part of the state, so it is hashed like anything else.
  */
 public final class InMemoryLedger {
 
@@ -42,6 +50,53 @@ public final class InMemoryLedger {
 
   /** Index: balance in signed minor units, debit-positive. Derived from the log. */
   private final Map<AccountId, Long> balances = new LinkedHashMap<>();
+
+  /** What a checkpoint already covered, in canonical order: the fold's starting point. */
+  private final Map<AccountId, Long> baselineBalances = new LinkedHashMap<>();
+
+  /** Journal events folded into the baseline, so {@link #journalEvents()} spans the whole log. */
+  private final long baselineEvents;
+
+  /** An empty ledger: no baseline, no events. What every non-recovering caller builds. */
+  public InMemoryLedger() {
+    this(List.of(), 0L);
+  }
+
+  /**
+   * A ledger that starts where a checkpoint stopped.
+   *
+   * <p>{@code baseline} is copied into canonical order and must sum to exactly zero, because a
+   * baseline that does not is a checkpoint describing a ledger that never was: double-entry is
+   * invariant, so Σ balances = 0 is a property of every state the log can produce and therefore
+   * a cheap, decisive check on a snapshot. Refusing it here turns a corrupt checkpoint into a
+   * cache miss at recovery rather than into a wrong balance later.
+   *
+   * @param baseline the accounts and balances the checkpoint covered
+   * @param baselineEvents how many journal events it took to reach them
+   */
+  public InMemoryLedger(List<AccountState> baseline, long baselineEvents) {
+    Objects.requireNonNull(baseline, "baseline state");
+    if (baselineEvents < 0L) {
+      throw new IllegalArgumentException("a baseline cannot cover " + baselineEvents + " events");
+    }
+    List<AccountState> ordered = new ArrayList<>(baseline);
+    ordered.sort(AccountState.CANONICAL_ORDER);
+    long total = 0L;
+    for (AccountState row : ordered) {
+      if (accounts.put(row.id(), new Account(row.id(), row.kind())) != null) {
+        throw new IllegalArgumentException("a baseline names " + row.id() + " twice");
+      }
+      balances.put(row.id(), row.balance().minorUnits());
+      baselineBalances.put(row.id(), row.balance().minorUnits());
+      total = Math.addExact(total, row.balance().minorUnits());
+    }
+    if (total != 0L) {
+      throw new IllegalArgumentException(
+          "a baseline whose balances sum to " + total + " minor units describes a ledger that"
+              + " could not have existed: Σ balances = 0 is invariant");
+    }
+    this.baselineEvents = baselineEvents;
+  }
 
   /**
    * Opens an account. Appends an event and moves no money, so it cannot disturb Σ balances.
@@ -260,11 +315,18 @@ public final class InMemoryLedger {
   }
 
   /**
-   * Recomputes every balance from the event log, ignoring the index. Slow, obvious, and the
-   * reference the index is judged against.
+   * Recomputes every balance from the baseline plus the event log, ignoring the index. Slow,
+   * obvious, and the reference the index is judged against.
+   *
+   * <p>Starting from the baseline is what makes this correct for a restored ledger: the events in
+   * the list are only the tail a checkpoint left to replay, so folding them alone would report
+   * every restored balance as zero.
    */
   public Map<AccountId, Money> foldBalances() {
     Map<AccountId, BigInteger> folded = new LinkedHashMap<>();
+    for (Map.Entry<AccountId, Long> row : baselineBalances.entrySet()) {
+      folded.put(row.getKey(), BigInteger.valueOf(row.getValue()));
+    }
     for (JournalEvent event : events) {
       if (event instanceof JournalEvent.AccountOpened opened) {
         folded.putIfAbsent(opened.account().id(), BigInteger.ZERO);
@@ -312,6 +374,38 @@ public final class InMemoryLedger {
   }
 
   /**
+   * How many journal events this state took, baseline included — the count a checkpoint carries
+   * so recovery can say how much of the log it covered.
+   */
+  public long journalEvents() {
+    return baselineEvents + events.size();
+  }
+
+  /** Whether this ledger was restored from a checkpoint rather than folded from nothing. */
+  public boolean restored() {
+    return !baselineBalances.isEmpty() || baselineEvents > 0L;
+  }
+
+  /**
+   * The whole materialized state — every account, its kind and its balance — in
+   * {@link AccountState#CANONICAL_ORDER}.
+   *
+   * <p>Canonical order rather than opening order, because this list is what a state hash is
+   * computed over and what a checkpoint stores: an order that depends on where a recovery started
+   * would make the same money hash differently on two paths through the same history, which is the
+   * failure ADR 0004 exists to make impossible.
+   */
+  public List<AccountState> state() {
+    List<AccountState> state = new ArrayList<>(balances.size());
+    for (Map.Entry<AccountId, Long> row : balances.entrySet()) {
+      Account account = accounts.get(row.getKey());
+      state.add(new AccountState(row.getKey(), account.kind(), Money.ofMinor(row.getValue())));
+    }
+    state.sort(AccountState.CANONICAL_ORDER);
+    return List.copyOf(state);
+  }
+
+  /**
    * Checks the ledger against its own log and throws if anything disagrees.
    *
    * <p>What it checks, in order: the account index equals the accounts the log opens; the
@@ -325,6 +419,9 @@ public final class InMemoryLedger {
    */
   public void audit() {
     Map<AccountId, Account> openedByLog = new LinkedHashMap<>();
+    for (Map.Entry<AccountId, Long> row : baselineBalances.entrySet()) {
+      openedByLog.put(row.getKey(), accounts.get(row.getKey()));
+    }
     int sequence = 0;
     for (JournalEvent event : events) {
       if (event instanceof JournalEvent.AccountOpened open) {
