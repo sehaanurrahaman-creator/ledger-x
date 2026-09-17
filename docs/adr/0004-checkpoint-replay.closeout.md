@@ -6,8 +6,15 @@ implemented in `src/main/java/dev/ledgerx/checkpoint/` (`StateHash`, `Checkpoint
 `dev.ledgerx.domain` (`InMemoryLedger.restored`) and `dev.ledgerx.journal`
 (`DurableLedger.open`/`writeCheckpoint`), and proved by
 `src/test/java/dev/ledgerx/checkpoint/` (`CheckpointContract`, 13 checks; `ReplayHarness`,
-12 trials × every byte offset in CI, 40 × 60 in the extended campaign). **PR #TBD** carries the
-work on branch `arena/01a0afb2-ledger-x`.
+12 trials × every byte offset in CI, 40 × 60 in the extended campaign). **[PR
+#25](https://github.com/sehaanurrahaman-creator/ledger-x/pull/25)** carries the work on branch
+`arena/01a0afb2-ledger-x` as four commits — `eec49f4` (the implementation and the two suites),
+`1eff5d0` (the ADR, README, closeout and resolution comment), `3a42e56` (a demo declaration
+javac's widened `size()` asked for), and `44466df` (the `-Xlint:try` fix below). **CI is green
+on them** (run `35235664712`): `PASS 5/5 substrate checks`, `PASS 19/19 wal checks`,
+`PASS 13/13 checkpoint checks`, `PASS 1000/1000 kill -9` cycles (280 unforced acks lost across
+`NO_FSYNC`'s power-loss model — the moving column), `PASS 9/9 property checks` at both sizes,
+and the replay harness step green in 39.6 s on the runner.
 
 **Everything the ticket asked for is in those commits; what is left is GitHub-side writing this
 integration cannot do**, as in [ADR 0003's closeout](./0003-wal-fsync.closeout.md): the token
@@ -16,6 +23,15 @@ attached after a reconnect writes *repo contents* (`git push` succeeds) while is
 the claim/resolution comments below stay payload files. Verify the permission object with
 `gh api repos/{owner}/{repo} --jq '.permissions'` before spending a token rotation on what is a
 scope setting.
+
+A third finding came from CI rather than from this sandbox, and it is the same toolchain story
+ADR 0003 §8 told: javac's `-Xlint:try` — promoted to an error by `-Werror`, not reported by the
+ECJ this sandbox compiles with — refuses an auto-closeable resource that is named but never
+referenced in its try body, which is exactly the shape of the refusal checks
+(`try (DurableLedger ignored = DurableLedger.open(...)) { throw new AssertionError(...); }`).
+The fix (`44466df`) references the resource in the assertion message, which is the better
+message anyway; ECJ cannot see this class of bug, so a locally green compile stays evidence
+about the code and never about CI's lint vocabulary.
 
 Two bugs this ticket's own tests found and fixed inside the session, both worth the sentence:
 the first draft of `DurableLedger.open` validated the checkpoint *after* `Wal.open` had repaired a
