@@ -55,6 +55,58 @@ public final class Replay {
   }
 
   /**
+   * Folds the records <em>after</em> a checkpoint's watermark into a ledger a checkpoint seeded.
+   *
+   * <p>This is the second half of "recovery = checkpoint + tail replay" and it is deliberately the
+   * same fold as {@link #foldEvents}, started later: the same validation, the same refusal of a
+   * posting the domain rejects, the same rule that a marker moves no money. What a checkpoint
+   * changes is where the fold starts, not what it does — which is why a checkpoint + tail and a
+   * replay from byte zero can be compared as one equality on the state hash rather than as a
+   * proof that two code paths agree.
+   *
+   * <p>Records at or below the watermark are skipped, not re-applied: re-applying a posting would
+   * move money twice, and the watermark is exactly the boundary that says which side of the
+   * checkpoint an event is on. Markers above it are skipped by the fold itself, as always.
+   *
+   * @param checkpointLsn the watermark of the state {@code ledger} was seeded with
+   * @return how many journal records were applied, which is the tail's real length
+   */
+  public static int foldAfter(long checkpointLsn, WalRecovery.Scan scan, InMemoryLedger ledger)
+      throws IOException {
+    int applied = 0;
+    for (WalRecord record : scan.records()) {
+      if (record.lsn().value() <= checkpointLsn) {
+        continue;
+      }
+      if (record.type().isJournalEvent()) {
+        applied++;
+      }
+      apply(ledger, record);
+    }
+    ledger.audit();
+    return applied;
+  }
+
+  /**
+   * The LSN of the last journal event a scan holds, 0 if it holds none.
+   *
+   * <p>It is the ledger's position as opposed to the log's: the recovery marker ADR 0003 appends
+   * after cutting a tear carries an LSN and moves no money, so a state's watermark is the last
+   * <em>journal</em> record, not the last frame in the file. That distinction is what keeps a state
+   * hash stable across a recovery: cutting a tear and marking the cut does not change any money,
+   * and it must not change the number a run is identified by.
+   */
+  public static long lastJournalLsn(WalRecovery.Scan scan) {
+    long last = 0L;
+    for (WalRecord record : scan.records()) {
+      if (record.type().isJournalEvent()) {
+        last = record.lsn().value();
+      }
+    }
+    return last;
+  }
+
+  /**
    * Applies one record to a ledger, or refuses the log.
    *
    * @return the event that was applied, so a caller can log or check it
