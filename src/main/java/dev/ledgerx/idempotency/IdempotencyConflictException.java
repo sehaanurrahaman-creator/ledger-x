@@ -35,10 +35,14 @@ public final class IdempotencyConflictException extends RuntimeException {
 
   private static final long serialVersionUID = 1L;
 
-  private final MerchantId merchant;
-  private final IdempotencyKey key;
-  private final RequestFingerprint boundTo;
-  private final RequestFingerprint presented;
+  // Transient by decision, the same one UnrecoverableLogException records: nothing here
+  // serializes a refusal, the finding is in the message, and a non-transient field of a
+  // non-serializable type inside a Serializable class is a javac -Xlint:serial warning this
+  // build treats as an error. The accessors, not the fields, are the API.
+  private final transient MerchantId merchant;
+  private final transient IdempotencyKey key;
+  private final transient RequestFingerprint boundTo;
+  private final transient RequestFingerprint presented;
 
   public IdempotencyConflictException(
       MerchantId merchant,

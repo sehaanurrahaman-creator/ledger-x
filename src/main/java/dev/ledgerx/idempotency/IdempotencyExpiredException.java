@@ -29,8 +29,11 @@ public final class IdempotencyExpiredException extends RuntimeException {
 
   private static final long serialVersionUID = 1L;
 
-  private final MerchantId merchant;
-  private final IdempotencyKey key;
+  // Transient by decision, as everywhere else a refusal carries value types: nothing
+  // serializes an exception across a boundary this project has not decided on yet, and the
+  // instants are primitives, which need no such help.
+  private final transient MerchantId merchant;
+  private final transient IdempotencyKey key;
   private final long capturedAtMillis;
   private final long retentionMillis;
 
